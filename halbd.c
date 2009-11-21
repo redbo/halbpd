@@ -6,6 +6,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <ctype.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -16,8 +17,8 @@
 #include <openssl/err.h>
 
 #define BUFSIZE 8192
+#define STACKSIZE (1024*1024*32) // 32 kb is enough for anyone
 #define TIMEOUT 10000000 // 10 seconds
-#define STACKSIZE (1024*1024*32)
 
 #define RSA_SERVER_CERT "server.crt"
 #define RSA_SERVER_KEY "server.key"
@@ -46,18 +47,12 @@ static int stb_free(BIO *a)
 
 static int stb_read(BIO *b, char *out, int outl)
 {
-  int len = 0;
-  if ((len = st_read((st_netfd_t)b->ptr, out, outl, TIMEOUT)) <= 0)
-    ;// perror("st_read");
-  return len;
+  return st_read((st_netfd_t)b->ptr, out, outl, TIMEOUT);
 }
 
 static int stb_write(BIO *b, const char *in, int inl)
 {
-  int len = 0;
-  if ((len = st_write((st_netfd_t)b->ptr, in, inl, TIMEOUT)) <= 0)
-    ; //perror("st_write");
-  return len;
+  return st_write((st_netfd_t)b->ptr, in, inl, TIMEOUT);
 }
 
 static int stb_puts(BIO *bp, const char *str)
@@ -91,27 +86,24 @@ static long stb_ctrl(BIO *b, int cmd, long num, void *ptr)
     case BIO_CTRL_SET_CLOSE:
       b->shutdown = (int)num;
       return 1;
-    case BIO_CTRL_DUP:
-    case BIO_CTRL_FLUSH:
+    case BIO_CTRL_DUP: case BIO_CTRL_FLUSH:
       return 1;
-    case BIO_CTRL_RESET:
-    case BIO_C_FILE_SEEK:
-    case BIO_C_FILE_TELL:
-    case BIO_CTRL_INFO:
-    case BIO_CTRL_PENDING:
-    case BIO_CTRL_WPENDING:
+    case BIO_CTRL_RESET: case BIO_C_FILE_SEEK: case BIO_C_FILE_TELL:
+    case BIO_CTRL_INFO: case BIO_CTRL_PENDING: case BIO_CTRL_WPENDING:
     default:
       return 0;
   }
 }
 
-#define xf4 "X-Forwarded-For: 127.0.0.1\r\n"
-#define lenxf4 28
 void *handle_connection(SSL *ssl)
 {
-  int size = 1;
   struct sockaddr_in sa_serv;
   int sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+  char xf4[64];
+  int lenxf4 = sprintf(xf4, "X-Forwarded-For: %s\r\n", (char *)ssl->msg_callback_arg);
+  int size = 1;
+  free(ssl->msg_callback_arg);
+  ssl->msg_callback_arg = NULL;
 
   if (sock < 0)
   {
@@ -145,9 +137,10 @@ void *handle_connection(SSL *ssl)
 
   void *client_to_server(void *arg)
   {
-    char buffer[BUFSIZE + lenxf4 + 1];
-    int buflen = 0, len;
-    int state = 0, scan = 0;
+    char buffer[BUFSIZE + sizeof(xf4) + 1];
+    char header[BUFSIZE], *hptr = header;
+    int state = 0, scan = 0, buflen = 0, len = 0;
+    int content_length = -1;
 
     while (ssl && (len = SSL_read(ssl, buffer + buflen, BUFSIZE - buflen)) > 0)
     {
@@ -155,34 +148,63 @@ void *handle_connection(SSL *ssl)
 
       for (; scan < buflen; scan++)
       {
-        switch(buffer[scan])
+        switch(state)
         {
-          case '\r':
-            switch(state)
+          case 0: // read request
+            if (buffer[scan] == '\n')
             {
-              case 0: state = 1; continue;
-              case 2: state = 3; continue;
-              case 4: state = 5; continue;
+              memmove(&buffer[scan+lenxf4+1], &buffer[scan+1], buflen - scan);
+              memcpy(&buffer[scan+1], xf4, lenxf4);
+              buflen += lenxf4;
+              scan += lenxf4;
+              state = 1;
+              content_length = -1;
             }
             continue;
-          case '\n':
-            switch(state)
+          case 1: // read headers, have appended xf4
+            if (buffer[scan] == '\n')
             {
-              case 1:
-                memmove(&buffer[scan+lenxf4+1], &buffer[scan+1], buflen - scan);
-                memcpy(&buffer[scan+1], xf4, lenxf4);
-                buflen += lenxf4;
-                state = 2;
-                state = 2; continue;
-              case 3: state = 4; continue;
-              case 5: state = 0; continue;
+              if (hptr - header < 3) // apparent end of headers
+              {
+                if (content_length > 0)
+                  state = 2;
+                else if (content_length == -2)
+                  state = 3;
+                else
+                  state = 0;
+              }
+              else
+              {
+                *hptr = 0;
+                if (toupper(header[0]) == 'C' && toupper(header[8]) == 'L'
+                      && !strncasecmp(header, "Content-Length: ", 16)
+                      && isdigit(header[17]))
+                  content_length = atoi(&header[16]);
+                if (toupper(header[0]) == 'T' && toupper(header[9]) == 'E'
+                      && tolower(header[19]) == 'c'
+                      && !strncasecmp(header, "Transfer-Encoding: chunked", 25))
+                  content_length = -2;
+              }
+              hptr = header;
+              *hptr = 0;
+            }
+            else
+              *hptr++ = buffer[scan];
+            continue;
+          case 2: // read body with content-length
+            if (scan + content_length <= buflen)
+            {
+              scan += content_length;
+              state = 0;
+            }
+            else
+            {
+              content_length -= (buflen - scan);
+              scan = buflen;
             }
             continue;
-          default:
-            switch (state)
-            {
-              case 3: case 4: case 5: state = 2; continue;
-            }
+          case 3: // TODO read chunked body
+            continue;
         }
       }
 
@@ -333,6 +355,7 @@ int main(int argc, char **argv)
         BIO *ret = BIO_new(&methods_stbp);
         BIO_set_fd(ret, client_sock, 1);
         SSL_set_bio(ssl, ret, ret);
+        ssl->msg_callback_arg = strdup(inet_ntoa(addr.sin_addr)); // stash this real quick
         st_thread_create((void *)(void *)handle_connection, ssl, 0, STACKSIZE);
       }
     }
