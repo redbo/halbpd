@@ -1,15 +1,10 @@
 #include <st.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <netdb.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <ctype.h>
-#include <sys/types.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <openssl/crypto.h>
@@ -20,8 +15,14 @@
 #define STACKSIZE (1024*1024*32) // 32 kb is enough for anyone
 #define TIMEOUT 10000000 // 10 seconds
 
-#define RSA_SERVER_CERT "server.crt"
-#define RSA_SERVER_KEY "server.key"
+#define unhex(x) (x <= '9' ? x - '0' : (x >= 'a' && x <= 'f' ? x - 'a' + 10 : x - 'A' + 10))
+
+typedef struct backend {
+  struct sockaddr_in sa;
+  struct backend *next;
+} backend;
+backend *backends = NULL;
+int backend_count = 0;
 
 static int stb_new(BIO *bi)
 {
@@ -95,13 +96,25 @@ static long stb_ctrl(BIO *b, int cmd, long num, void *ptr)
   }
 }
 
+struct sockaddr_in *get_backend() // round-robin across backends
+{
+  static int i;
+  int j;
+  i = (i + 1) % backend_count;
+  backend *back = backends;
+  for (j = 0; j < i; j++)
+    back = back->next;
+  return &back->sa;
+}
+
 void *handle_connection(SSL *ssl)
 {
-  struct sockaddr_in sa_serv;
+  struct sockaddr_in *sa_serv = get_backend();
   int sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
   char xf4[64];
   int lenxf4 = sprintf(xf4, "X-Forwarded-For: %s\r\n", (char *)ssl->msg_callback_arg);
   int size = 1;
+
   free(ssl->msg_callback_arg);
   ssl->msg_callback_arg = NULL;
 
@@ -118,12 +131,7 @@ void *handle_connection(SSL *ssl)
     goto cleanup;
   }
 
-  memset(&sa_serv, 0, sizeof(sa_serv));
-  sa_serv.sin_family = AF_INET;
-  sa_serv.sin_addr.s_addr = inet_addr("127.0.0.1");
-  sa_serv.sin_port = htons(8080);
-
-  if (st_connect(server_sock, (struct sockaddr *)&sa_serv, sizeof(sa_serv), TIMEOUT))
+  if (st_connect(server_sock, (struct sockaddr *)sa_serv, sizeof(*sa_serv), TIMEOUT))
   {
     perror("st_connect");
     goto cleanup;
@@ -148,7 +156,7 @@ void *handle_connection(SSL *ssl)
 
       for (; scan < buflen; scan++)
       {
-        switch(state)
+        switch(state) // crazy state machine
         {
           case 0: // read request
             if (buffer[scan] == '\n')
@@ -164,12 +172,15 @@ void *handle_connection(SSL *ssl)
           case 1: // read headers, have appended xf4
             if (buffer[scan] == '\n')
             {
-              if (hptr - header < 3) // apparent end of headers
+              if (hptr - header < 3) // end of headers
               {
                 if (content_length > 0)
                   state = 2;
                 else if (content_length == -2)
+                {
                   state = 3;
+                  content_length = 0;
+                }
                 else
                   state = 0;
               }
@@ -203,7 +214,33 @@ void *handle_connection(SSL *ssl)
               scan = buflen;
             }
             continue;
-          case 3: // TODO read chunked body
+          case 3: // read chunked body length
+            if (buffer[scan] > ' ')
+              content_length = content_length * 16 + unhex(buffer[scan]);
+            else if (buffer[scan] == '\n')
+              state = 4;
+            continue;
+          case 4: // read chunked body
+            if (scan + content_length <= buflen)
+            {
+              scan += content_length;
+              state = 5;
+            }
+            else
+            {
+              content_length -= (buflen - scan);
+              scan = buflen;
+            }
+            continue;
+          case 5: // look for newline after chunk
+            if (buffer[scan] == '\n')
+            {
+              if (content_length == 0)
+                state = 0;
+              else
+                state = 3;
+              content_length = 0;
+            }
             continue;
         }
       }
@@ -265,10 +302,30 @@ void *handle_connection(SSL *ssl)
   return NULL;
 }
 
+int default_process_count()
+{
+  FILE *fp = fopen("/proc/cpuinfo", "r");
+  char buf[1024];
+  int processors = 0;
+  while (fgets(buf, sizeof(buf), fp))
+  {
+    if (!strncmp(buf, "processor\t", 10))
+      processors++;
+  }
+  fprintf(stderr, "Starting up %d processes.\n", processors);
+  fclose(fp);
+  if (processors > 0 && processors <= 32)
+    return processors;
+  return 4;
+}
+
 int main(int argc, char **argv)
 {
-  short int s_port = 1025;
-  int listen_sock;
+  int s_port = 443;
+  char rsa_server_cert[1024] = "/etc/halbd/server.crt";
+  char rsa_server_key[1024] = "/etc/halbd/server.key";
+  char backend_list[2048] = "127.0.0.1:80", *list = backend_list, *token;
+  int listen_sock, process_count;
   struct sockaddr_in sa_serv;
   SSL_CTX *ctx;
   SSL_METHOD *meth;
@@ -287,13 +344,52 @@ int main(int argc, char **argv)
     NULL,
   };
 
+  FILE *fp = fopen("/etc/halbd/conf", "r");
+  if (fp)
+  {
+    char line[2048];
+    while (fgets(line, sizeof(line), fp))
+    {
+      sscanf(line, " cert = %s ", rsa_server_cert);
+      sscanf(line, " key = %s ", rsa_server_key);
+      sscanf(line, " port = %d ", &s_port);
+      sscanf(line, " backends = %[^\n] ", backend_list);
+    }
+  }
+  else
+  {
+    fprintf(stderr, "Expected to find /etc/halbd/conf like:\n"
+                    " cert = /etc/halbd/server.crt\n"
+                    " key = /etc/halbd/server.key\n"
+                    " port = 443\n"
+                    " backends = 127.0.0.1:80 ; 127.0.0.2:80\n");
+    return 1;
+  }
+  while ((token = strtok(list, ";")))
+  {
+    char ip[16];
+    int port;
+    if (sscanf(token, " %[^:] : %d ", ip, &port))
+    {
+      backend *back = (backend *)calloc(sizeof(backend), 1);
+      back->sa.sin_family = AF_INET;
+      back->sa.sin_addr.s_addr = inet_addr(ip);
+      back->sa.sin_port = htons(port);
+      back->next = backends;
+      backends = back;
+      backend_count++;
+    }
+    list = NULL;
+  }
+  fprintf(stderr, "Initialized %d backends.\n", backend_count);
+
   SSL_library_init();
   SSL_load_error_strings();
 
   if (!(meth = SSLv23_server_method()) ||
       !(ctx = SSL_CTX_new(meth)) ||
-      (SSL_CTX_use_certificate_file(ctx, RSA_SERVER_CERT, SSL_FILETYPE_PEM) <= 0) ||
-      (SSL_CTX_use_PrivateKey_file(ctx, RSA_SERVER_KEY, SSL_FILETYPE_PEM) <= 0))
+      (SSL_CTX_use_certificate_file(ctx, rsa_server_cert, SSL_FILETYPE_PEM) <= 0) ||
+      (SSL_CTX_use_PrivateKey_file(ctx, rsa_server_key, SSL_FILETYPE_PEM) <= 0))
   {
     ERR_print_errors_fp(stderr);
     return 1;
@@ -329,8 +425,16 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  fork();
-  fork();
+  process_count = default_process_count();
+  while (--process_count)
+  {
+    if (!fork())
+      break;
+  }
+
+  if (fork()) // daemonize
+    return 0;
+  setsid();
 
   st_init();
   #if defined(ST_EVENTSYS_ALT)
