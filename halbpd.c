@@ -322,8 +322,8 @@ int default_process_count()
 int main(int argc, char **argv)
 {
   int s_port = 443;
-  char rsa_server_cert[1024] = "/etc/halbd/server.crt";
-  char rsa_server_key[1024] = "/etc/halbd/server.key";
+  char rsa_server_cert[1024] = "/etc/halbpd/server.crt";
+  char rsa_server_key[1024] = "/etc/halbpd/server.key";
   char backend_list[2048] = "127.0.0.1:80", *list = backend_list, *token;
   int listen_sock, process_count;
   struct sockaddr_in sa_serv;
@@ -344,7 +344,7 @@ int main(int argc, char **argv)
     NULL,
   };
 
-  FILE *fp = fopen("/etc/halbd/conf", "r");
+  FILE *fp = fopen("/etc/halbpd/conf", "r");
   if (fp)
   {
     char line[2048];
@@ -358,9 +358,9 @@ int main(int argc, char **argv)
   }
   else
   {
-    fprintf(stderr, "Expected to find /etc/halbd/conf like:\n"
-                    " cert = /etc/halbd/server.crt\n"
-                    " key = /etc/halbd/server.key\n"
+    fprintf(stderr, "Expected to find /etc/halbpd/conf like:\n"
+                    " cert = /etc/halbpd/server.crt\n"
+                    " key = /etc/halbpd/server.key\n"
                     " port = 443\n"
                     " backends = 127.0.0.1:80 ; 127.0.0.2:80\n");
     return 1;
