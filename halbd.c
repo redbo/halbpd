@@ -12,8 +12,8 @@
 #include <openssl/err.h>
 
 #define BUFSIZE 8192
-#define STACKSIZE (1024*1024*32) // 32 kb is enough for anyone
-#define TIMEOUT 10000000 // 10 seconds
+#define STACKSIZE (1024*1024*16) // 16 kb is enough for anyone
+#define TIMEOUT 30000000 // 30 seconds
 
 #define unhex(x) (x <= '9' ? x - '0' : (x >= 'a' && x <= 'f' ? x - 'a' + 10 : x - 'A' + 10))
 
@@ -150,7 +150,7 @@ void *handle_connection(SSL *ssl)
     int state = 0, scan = 0, buflen = 0, len = 0;
     int content_length = -1;
 
-    while (ssl && (len = SSL_read(ssl, buffer + buflen, BUFSIZE - buflen)) > 0)
+    while ((len = SSL_read(ssl, buffer + buflen, BUFSIZE - buflen)) > 0)
     {
       buflen += len;
 
@@ -267,7 +267,7 @@ void *handle_connection(SSL *ssl)
   {
     char buffer[BUFSIZE];
     int buflen = 0, len;
-    while (ssl && (len = st_read(server_sock, buffer + buflen, sizeof(buffer) - buflen, TIMEOUT)) > 0)
+    while ((len = st_read(server_sock, buffer + buflen, sizeof(buffer) - buflen, TIMEOUT)) > 0)
     {
       buflen += len;
       if ((len = SSL_write(ssl, buffer, buflen)) <= 0)
