@@ -4,6 +4,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -11,15 +12,19 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-#define BUFSIZE 8192
-#define STACKSIZE (1024*1024*16) // 16 kb is enough for anyone
+#define BUFSIZE 16384
+#define STACKSIZE (1024 * 32) // 32 kb is enough for anyone
 #define TIMEOUT 30000000 // 30 seconds
+#define BACKEND_TIMEOUT 5000000 // 2 seconds
+#define ERROR_OUT 60
 
 #define unhex(x) (x <= '9' ? x - '0' : (x >= 'a' && x <= 'f' ? x - 'a' + 10 : x - 'A' + 10))
 
 typedef struct backend {
   struct sockaddr_in sa;
   struct backend *next;
+  int errors;
+  time_t errored;
 } backend;
 backend *backends = NULL;
 int backend_count = 0;
@@ -46,19 +51,19 @@ static int stb_free(BIO *a)
   return 1;
 }
 
-static int stb_read(BIO *b, char *out, int outl)
+static int stb_read(BIO *b, char *out, int len)
 {
-  return st_read((st_netfd_t)b->ptr, out, outl, TIMEOUT);
+  return st_read((st_netfd_t)b->ptr, out, len, TIMEOUT);
 }
 
-static int stb_write(BIO *b, const char *in, int inl)
+static int stb_write(BIO *b, const char *str, int len)
 {
-  return st_write((st_netfd_t)b->ptr, in, inl, TIMEOUT);
+  return st_write((st_netfd_t)b->ptr, str, len, TIMEOUT);
 }
 
-static int stb_puts(BIO *bp, const char *str)
+static int stb_puts(BIO *b, const char *str)
 {
-  return stb_write(bp, str, strlen(str));
+  return st_write((st_netfd_t)b->ptr, str, strlen(str), TIMEOUT);
 }
 
 static long stb_ctrl(BIO *b, int cmd, long num, void *ptr)
@@ -75,7 +80,7 @@ static long stb_ctrl(BIO *b, int cmd, long num, void *ptr)
     case BIO_C_GET_FD:
       if (b->init)
       {
-        ip=(int *)ptr;
+        ip = (int *)ptr;
         if (ip != NULL)
           *ip = st_netfd_fileno((st_netfd_t)b->ptr);
         return *ip;
@@ -89,28 +94,54 @@ static long stb_ctrl(BIO *b, int cmd, long num, void *ptr)
       return 1;
     case BIO_CTRL_DUP: case BIO_CTRL_FLUSH:
       return 1;
-    case BIO_CTRL_RESET: case BIO_C_FILE_SEEK: case BIO_C_FILE_TELL:
-    case BIO_CTRL_INFO: case BIO_CTRL_PENDING: case BIO_CTRL_WPENDING:
     default:
       return 0;
   }
 }
 
-struct sockaddr_in *get_backend() // round-robin across backends
+st_netfd_t connect_backend() // round-robin across backends
 {
   static int i;
-  int j;
-  i = (i + 1) % backend_count;
-  backend *back = backends;
-  for (j = 0; j < i; j++)
-    back = back->next;
-  return &back->sa;
+  int j, k, sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+  if (sock < 0)
+    return NULL;
+
+  st_netfd_t server_sock = st_netfd_open_socket(sock);
+
+  if (!server_sock)
+    return NULL;
+
+  for (k = 0; k < backend_count; k++)
+  {
+    i = (i + 1) % backend_count;
+    backend *back = backends;
+    for (j = 0; j < i; j++)
+      back = back->next;
+    if (back->errors > 10)
+    {
+      if ((back->errored + ERROR_OUT) > time(NULL))
+        continue;
+      else if (back->errored == 0)
+      {
+        back->errored = time(NULL);
+        continue;
+      }
+      else
+      {
+        back->errors = 0;
+        back->errored = 0;
+      }
+    }
+    if (!st_connect(server_sock, (struct sockaddr *)(&back->sa), sizeof(back->sa), BACKEND_TIMEOUT))
+      return server_sock;
+    back->errors++;
+  }
+  return NULL;
 }
 
 void *handle_connection(SSL *ssl)
 {
-  struct sockaddr_in *sa_serv = get_backend();
-  int sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
   char xf4[64];
   int lenxf4 = sprintf(xf4, "X-Forwarded-For: %s\r\n", (char *)ssl->msg_callback_arg);
   int size = 1;
@@ -118,24 +149,9 @@ void *handle_connection(SSL *ssl)
   free(ssl->msg_callback_arg);
   ssl->msg_callback_arg = NULL;
 
-  if (sock < 0)
-  {
-    perror("socket");
-    goto cleanup;
-  }
-
-  st_netfd_t server_sock = st_netfd_open_socket(sock);
+  st_netfd_t server_sock = connect_backend();
   if (!server_sock)
-  {
-    perror("st_netfd_open_socket");
     goto cleanup;
-  }
-
-  if (st_connect(server_sock, (struct sockaddr *)sa_serv, sizeof(*sa_serv), TIMEOUT))
-  {
-    perror("st_connect");
-    goto cleanup;
-  }
 
   setsockopt(st_netfd_fileno(server_sock), IPPROTO_TCP, TCP_NODELAY, &size, sizeof(size));
   SSL_set_accept_state(ssl);
@@ -287,7 +303,7 @@ void *handle_connection(SSL *ssl)
   c2s = st_thread_create(client_to_server, NULL, 1, STACKSIZE);
   if (!c2s)
   {
-    perror("st_thread_create");
+    // perror("st_thread_create");
     goto cleanup;
   }
   s2c = st_thread_create(server_to_client, NULL, 1, STACKSIZE);
@@ -297,7 +313,8 @@ void *handle_connection(SSL *ssl)
   cleanup:
     SSL_shutdown(ssl);
     SSL_free(ssl);
-    st_netfd_close(server_sock);
+    if (server_sock)
+      st_netfd_close(server_sock);
 
   return NULL;
 }
@@ -322,13 +339,13 @@ int default_process_count()
 int main(int argc, char **argv)
 {
   int s_port = 443;
+  char cipher_list[1024] = "RC4-MD5:RC4-SHA:RC4:MD5:SHA:ALL"; // "AES256-SHA:AES128-SHA:ALL";
   char rsa_server_cert[1024] = "/etc/halbpd/server.crt";
   char rsa_server_key[1024] = "/etc/halbpd/server.key";
   char backend_list[2048] = "127.0.0.1:80", *list = backend_list, *token;
-  int listen_sock, process_count;
+  int listen_sock, process_count = 0;
   struct sockaddr_in sa_serv;
   SSL_CTX *ctx;
-  SSL_METHOD *meth;
   st_netfd_t listener, client;
   BIO_METHOD methods_stbp =
   {
@@ -353,15 +370,19 @@ int main(int argc, char **argv)
       sscanf(line, " cert = %s ", rsa_server_cert);
       sscanf(line, " key = %s ", rsa_server_key);
       sscanf(line, " port = %d ", &s_port);
+      sscanf(line, " workers = %d ", &process_count);
+      sscanf(line, " ciphers = %s ", cipher_list);
       sscanf(line, " backends = %[^\n] ", backend_list);
     }
   }
   else
   {
     fprintf(stderr, "Expected to find /etc/halbpd/conf like:\n"
+                    " # workers = 0\n"
+                    " # port = 443\n"
+                    " # ciphers = AES256-SHA:AES128-SHA:SHA1:ALL\n"
                     " cert = /etc/halbpd/server.crt\n"
                     " key = /etc/halbpd/server.key\n"
-                    " port = 443\n"
                     " backends = 127.0.0.1:80 ; 127.0.0.2:80\n");
     return 1;
   }
@@ -372,6 +393,8 @@ int main(int argc, char **argv)
     if (sscanf(token, " %[^:] : %d ", ip, &port))
     {
       backend *back = (backend *)calloc(sizeof(backend), 1);
+      back->errors = 0;
+      back->errored = 0;
       back->sa.sin_family = AF_INET;
       back->sa.sin_addr.s_addr = inet_addr(ip);
       back->sa.sin_port = htons(port);
@@ -381,13 +404,14 @@ int main(int argc, char **argv)
     }
     list = NULL;
   }
-  fprintf(stderr, "Initialized %d backends.\n", backend_count);
+  fprintf(stderr, "Found %d backends.\n", backend_count);
 
   SSL_library_init();
   SSL_load_error_strings();
 
-  if (!(meth = SSLv23_server_method()) ||
-      !(ctx = SSL_CTX_new(meth)) ||
+  if (!(ctx = SSL_CTX_new(SSLv23_server_method())) ||
+      !SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_ALL) ||
+      !SSL_CTX_set_cipher_list(ctx, cipher_list) ||
       (SSL_CTX_use_certificate_file(ctx, rsa_server_cert, SSL_FILETYPE_PEM) <= 0) ||
       (SSL_CTX_use_PrivateKey_file(ctx, rsa_server_key, SSL_FILETYPE_PEM) <= 0))
   {
@@ -425,7 +449,8 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  process_count = default_process_count();
+  if (!process_count)
+    process_count = default_process_count();
   while (--process_count)
   {
     if (!fork())
