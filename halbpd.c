@@ -18,16 +18,14 @@
 #define BACKEND_TIMEOUT 5000000 // 2 seconds
 #define ERROR_OUT 60
 
-#define unhex(x) (x <= '9' ? x - '0' : (x >= 'a' && x <= 'f' ? x - 'a' + 10 : x - 'A' + 10))
+typedef struct conndata {
+  struct sockaddr addr;
+  struct sockaddr_in *addr_in;
+  SSL *ssl;
+} conndata;
 
-typedef struct backend {
-  struct sockaddr_in sa;
-  struct backend *next;
-  int errors;
-  time_t errored;
-} backend;
-backend *backends = NULL;
-int backend_count = 0;
+struct sockaddr_in backend_sa;
+struct sockaddr_in server_sa;
 
 static int stb_new(BIO *bi)
 {
@@ -99,10 +97,13 @@ static long stb_ctrl(BIO *b, int cmd, long num, void *ptr)
   }
 }
 
-st_netfd_t connect_backend() // round-robin across backends
+void *handle_connection(conndata *data)
 {
-  static int i;
-  int j, k, sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+  int size = 1;
+  st_thread_t c2s;
+  st_thread_t s2c;
+
+  int sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 
   if (sock < 0)
     return NULL;
@@ -110,211 +111,80 @@ st_netfd_t connect_backend() // round-robin across backends
   st_netfd_t server_sock = st_netfd_open_socket(sock);
 
   if (!server_sock)
-    return NULL;
+    goto cleanup;
 
-  for (k = 0; k < backend_count; k++)
-  {
-    i = (i + 1) % backend_count;
-    backend *back = backends;
-    for (j = 0; j < i; j++)
-      back = back->next;
-    if (back->errors > 10)
-    {
-      if ((back->errored + ERROR_OUT) > time(NULL))
-        continue;
-      else if (back->errored == 0)
-      {
-        back->errored = time(NULL);
-        continue;
-      }
-      else
-      {
-        back->errors = 0;
-        back->errored = 0;
-      }
-    }
-    if (!st_connect(server_sock, (struct sockaddr *)(&back->sa), sizeof(back->sa), BACKEND_TIMEOUT))
-      return server_sock;
-    back->errors++;
-  }
-  return NULL;
-}
-
-void *handle_connection(SSL *ssl)
-{
-  char xf4[64];
-  int lenxf4 = sprintf(xf4, "X-Forwarded-For: %s\r\n", (char *)ssl->msg_callback_arg);
-  int size = 1;
-
-  free(ssl->msg_callback_arg);
-  ssl->msg_callback_arg = NULL;
-
-  st_netfd_t server_sock = connect_backend();
-  if (!server_sock)
+  if (st_connect(server_sock, (struct sockaddr *)(&backend_sa), sizeof(backend_sa), BACKEND_TIMEOUT))
     goto cleanup;
 
   setsockopt(st_netfd_fileno(server_sock), IPPROTO_TCP, TCP_NODELAY, &size, sizeof(size));
-  SSL_set_accept_state(ssl);
-
-  st_thread_t c2s;
-  st_thread_t s2c;
+  SSL_set_accept_state(data->ssl);
 
   void *client_to_server(void *arg)
   {
-    char buffer[BUFSIZE + sizeof(xf4) + 1];
-    char header[BUFSIZE], *hptr = header;
-    int state = 0, scan = 0, buflen = 0, len = 0;
-    int content_length = -1;
+    char buffer[BUFSIZE], ipbuf[1024];
+    int bufpos = 0, buflen = 0, wlen = 0;
+    SSL *ssl = data->ssl;
 
-    while ((len = SSL_read(ssl, buffer + buflen, BUFSIZE - buflen)) > 0)
+    buflen = snprintf(buffer, sizeof(buffer), "PROXY %s %s %s %u %u\r\n",
+            (data->addr.sa_family == AF_INET6) ? "TCP6" : "TCP4",
+            inet_ntop(data->addr_in->sin_family, &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
+            inet_ntop(server_sa.sin_family, &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
+            ntohs(data->addr_in->sin_port),
+            ntohs(server_sa.sin_port));
+
+    do
     {
-      buflen += len;
+      bufpos = 0;
+      while (bufpos < buflen)
+      {
+        wlen = st_write(server_sock, buffer + bufpos, buflen - bufpos, TIMEOUT);
+        if (wlen <= 0)
+          goto client_to_server_cleanup;
+        bufpos += wlen;
+      }
+    } while ((buflen = SSL_read(ssl, buffer, BUFSIZE)) > 0);
 
-      for (; scan < buflen; scan++)
-      {
-        switch(state) // crazy state machine
-        {
-          case 0: // read request
-            if (buffer[scan] == '\n')
-            {
-              memmove(&buffer[scan+lenxf4+1], &buffer[scan+1], buflen - scan);
-              memcpy(&buffer[scan+1], xf4, lenxf4);
-              buflen += lenxf4;
-              scan += lenxf4;
-              state = 1;
-              content_length = -1;
-            }
-            continue;
-          case 1: // read headers, have appended xf4
-            if (buffer[scan] == '\n')
-            {
-              if (hptr - header < 3) // end of headers
-              {
-                if (content_length > 0)
-                  state = 2;
-                else if (content_length == -2)
-                {
-                  state = 3;
-                  content_length = 0;
-                }
-                else
-                  state = 0;
-              }
-              else
-              {
-                *hptr = 0;
-                if (toupper(header[0]) == 'C' && toupper(header[8]) == 'L'
-                      && !strncasecmp(header, "Content-Length: ", 16)
-                      && isdigit(header[17]))
-                  content_length = atoi(&header[16]);
-                if (toupper(header[0]) == 'T' && toupper(header[9]) == 'E'
-                      && tolower(header[19]) == 'c'
-                      && !strncasecmp(header, "Transfer-Encoding: chunked", 25))
-                  content_length = -2;
-              }
-              hptr = header;
-              *hptr = 0;
-            }
-            else
-              *hptr++ = buffer[scan];
-            continue;
-          case 2: // read body with content-length
-            if (scan + content_length <= buflen)
-            {
-              scan += content_length;
-              state = 0;
-            }
-            else
-            {
-              content_length -= (buflen - scan);
-              scan = buflen;
-            }
-            continue;
-          case 3: // read chunked body length
-            if (buffer[scan] > ' ')
-              content_length = content_length * 16 + unhex(buffer[scan]);
-            else if (buffer[scan] == '\n')
-              state = 4;
-            continue;
-          case 4: // read chunked body
-            if (scan + content_length <= buflen)
-            {
-              scan += content_length;
-              state = 5;
-            }
-            else
-            {
-              content_length -= (buflen - scan);
-              scan = buflen;
-            }
-            continue;
-          case 5: // look for newline after chunk
-            if (buffer[scan] == '\n')
-            {
-              if (content_length == 0)
-                state = 0;
-              else
-                state = 3;
-              content_length = 0;
-            }
-            continue;
-        }
-      }
-
-      if ((len = st_write(server_sock, buffer, buflen, TIMEOUT)) <= 0)
-        break;
-      else if (len == buflen)
-      {
-        scan = 0;
-        buflen = 0;
-      }
-      else
-      {
-        memmove(buffer, buffer + len, buflen - len);
-        buflen -= len;
-        scan -= len;
-      }
-    }
-    st_thread_interrupt(s2c);
-    return NULL;
+    client_to_server_cleanup:
+      st_thread_interrupt(s2c);
+      return NULL;
   }
 
   void *server_to_client(void *arg)
   {
     char buffer[BUFSIZE];
-    int buflen = 0, len;
-    while ((len = st_read(server_sock, buffer + buflen, sizeof(buffer) - buflen, TIMEOUT)) > 0)
+    int bufpos = 0, buflen = 0, wlen = 0;
+    SSL *ssl = data->ssl;
+
+    while ((buflen = st_read(server_sock, buffer + buflen, sizeof(buffer) - buflen, TIMEOUT)) > 0)
     {
-      buflen += len;
-      if ((len = SSL_write(ssl, buffer, buflen)) <= 0)
-        break;
-      else if (len == buflen)
-        buflen = 0;
-      else
+      bufpos = 0;
+      while (bufpos < buflen)
       {
-        memmove(buffer, buffer + len, buflen - len);
-        buflen -= len;
+        wlen = SSL_write(ssl, buffer, buflen);
+        if (wlen <= 0)
+          goto server_to_client_cleanup;
+        bufpos += wlen;
       }
     }
-    st_thread_interrupt(c2s);
-    return NULL;
+    server_to_client_cleanup:
+      st_thread_interrupt(s2c);
+      return NULL;
   }
 
   c2s = st_thread_create(client_to_server, NULL, 1, STACKSIZE);
-  if (!c2s)
+  if (c2s)
   {
-    // perror("st_thread_create");
-    goto cleanup;
+    s2c = st_thread_create(server_to_client, NULL, 1, STACKSIZE);
+    st_thread_join(c2s, NULL);
+    st_thread_join(s2c, NULL);
   }
-  s2c = st_thread_create(server_to_client, NULL, 1, STACKSIZE);
-  st_thread_join(c2s, NULL);
-  st_thread_join(s2c, NULL);
 
   cleanup:
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
+    SSL_shutdown(data->ssl);
+    SSL_free(data->ssl);
     if (server_sock)
       st_netfd_close(server_sock);
+    free(data);
 
   return NULL;
 }
@@ -331,22 +201,25 @@ int default_process_count()
   }
   fprintf(stderr, "Starting up %d processes.\n", processors);
   fclose(fp);
-  if (processors > 0 && processors <= 32)
-    return processors;
-  return 4;
+  if (processors > 0 && processors <= 128)
+    return processors * 2;
+  return 16;
 }
 
 int main(int argc, char **argv)
 {
   int s_port = 443;
-  char cipher_list[1024] = "RC4-MD5:RC4-SHA:RC4:MD5:SHA:ALL"; // "AES256-SHA:AES128-SHA:ALL";
+  // "RC4-MD5:RC4-SHA:RC4:MD5:SHA:ALL"
+  char cipher_list[1024] = "AES256-SHA:AES128-SHA:ALL";
   char rsa_server_cert[1024] = "/etc/halbpd/server.crt";
   char rsa_server_key[1024] = "/etc/halbpd/server.key";
-  char backend_list[2048] = "127.0.0.1:80", *list = backend_list, *token;
+  char backend[1024] = "127.0.0.1:80";
   int listen_sock, process_count = 0;
-  struct sockaddr_in sa_serv;
   SSL_CTX *ctx;
   st_netfd_t listener, client;
+  char ip[16];
+  int port;
+
   BIO_METHOD methods_stbp =
   {
     BIO_TYPE_SOCKET,
@@ -364,7 +237,7 @@ int main(int argc, char **argv)
   FILE *fp = fopen("/etc/halbpd/conf", "r");
   if (fp)
   {
-    char line[2048];
+    char line[1024];
     while (fgets(line, sizeof(line), fp))
     {
       sscanf(line, " cert = %s ", rsa_server_cert);
@@ -372,7 +245,7 @@ int main(int argc, char **argv)
       sscanf(line, " port = %d ", &s_port);
       sscanf(line, " workers = %d ", &process_count);
       sscanf(line, " ciphers = %s ", cipher_list);
-      sscanf(line, " backends = %[^\n] ", backend_list);
+      sscanf(line, " backend = %[^\n] ", backend);
     }
   }
   else
@@ -383,28 +256,17 @@ int main(int argc, char **argv)
                     " # ciphers = AES256-SHA:AES128-SHA:SHA1:ALL\n"
                     " cert = /etc/halbpd/server.crt\n"
                     " key = /etc/halbpd/server.key\n"
-                    " backends = 127.0.0.1:80 ; 127.0.0.2:80\n");
+                    " backend = 127.0.0.1:80\n");
     return 1;
   }
-  while ((token = strtok(list, ";")))
+
+  if (sscanf(backend, " %[^:] : %d ", ip, &port))
   {
-    char ip[16];
-    int port;
-    if (sscanf(token, " %[^:] : %d ", ip, &port))
-    {
-      backend *back = (backend *)calloc(sizeof(backend), 1);
-      back->errors = 0;
-      back->errored = 0;
-      back->sa.sin_family = AF_INET;
-      back->sa.sin_addr.s_addr = inet_addr(ip);
-      back->sa.sin_port = htons(port);
-      back->next = backends;
-      backends = back;
-      backend_count++;
-    }
-    list = NULL;
+    memset(&backend_sa, '\0', sizeof(server_sa));
+    backend_sa.sin_family = AF_INET;
+    backend_sa.sin_addr.s_addr = inet_addr(ip);
+    backend_sa.sin_port = htons(port);
   }
-  fprintf(stderr, "Found %d backends.\n", backend_count);
 
   SSL_library_init();
   SSL_load_error_strings();
@@ -432,12 +294,12 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  memset (&sa_serv, '\0', sizeof(sa_serv));
-  sa_serv.sin_family = AF_INET;
-  sa_serv.sin_addr.s_addr = INADDR_ANY;
-  sa_serv.sin_port = htons(s_port);
+  memset(&server_sa, '\0', sizeof(server_sa));
+  server_sa.sin_family = AF_INET;
+  server_sa.sin_addr.s_addr = INADDR_ANY;
+  server_sa.sin_port = htons(s_port);
 
-  if (bind(listen_sock, (struct sockaddr*)&sa_serv, sizeof(sa_serv)) < 0)
+  if (bind(listen_sock, (struct sockaddr*)&server_sa, sizeof(server_sa)) < 0)
   {
     perror("bind");
     return 1;
@@ -470,22 +332,22 @@ int main(int argc, char **argv)
 
   for (;;)
   {
-    struct sockaddr_in addr;
-    int adlen = sizeof(addr);
-    if ((client = st_accept(listener, (struct sockaddr*)&addr, &adlen, TIMEOUT)))
+    conndata *data = (conndata *)malloc(sizeof(conndata));
+    int adlen = sizeof(data->addr);
+    if ((client = st_accept(listener, (struct sockaddr*)&(data->addr), &adlen, TIMEOUT)))
     {
+      data->addr_in = (struct sockaddr_in *)&(data->addr);
       int client_sock = st_netfd_fileno(client);
       int size = 1;
       st_netfd_free(client);
       setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, &size, sizeof(size));
       if (client_sock >= 0)
       {
-        SSL *ssl = SSL_new(ctx);
+        data->ssl = SSL_new(ctx);
         BIO *ret = BIO_new(&methods_stbp);
         BIO_set_fd(ret, client_sock, 1);
-        SSL_set_bio(ssl, ret, ret);
-        ssl->msg_callback_arg = strdup(inet_ntoa(addr.sin_addr)); // stash this real quick
-        st_thread_create((void *)(void *)handle_connection, ssl, 0, STACKSIZE);
+        SSL_set_bio(data->ssl, ret, ret);
+        st_thread_create((void *)(void *)handle_connection, data, 0, STACKSIZE);
       }
     }
   }
