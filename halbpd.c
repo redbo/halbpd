@@ -6,6 +6,8 @@
 #include <ctype.h>
 #include <time.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <openssl/crypto.h>
@@ -14,9 +16,14 @@
 
 #define BUFSIZE 16384
 #define STACKSIZE (1024 * 32) // 32 kb is enough for anyone
-#define TIMEOUT 30000000 // 30 seconds
-#define BACKEND_TIMEOUT 5000000 // 2 seconds
-#define ERROR_OUT 60
+#define TIMEOUT 60000000 // 60 seconds
+#define BACKEND_CONNECT_TIMEOUT 5000000 // 2 seconds
+#define DEFAULT_CONFIG_FILE "/etc/halbpd/conf"
+#define DEFAULT_CIPHER_LIST "AES128-SHA:AES:RC4:CAMELLIA128-SHA:!MD5:!ADH:!DH:!ECDH:!PSK:!SSLv2"
+#define DEFAULT_CERT_FILE "/etc/halbpd/server.crt"
+#define DEFAULT_KEY_FILE "/etc/halbpd/server.key"
+#define DEFAULT_BACKEND "127.0.0.1:80"
+#define DEFAULT_FRONTEND "0.0.0.0:443"
 
 typedef struct conndata {
   struct sockaddr addr;
@@ -24,8 +31,9 @@ typedef struct conndata {
   SSL *ssl;
 } conndata;
 
-struct sockaddr_in backend_sa;
-struct sockaddr_in server_sa;
+struct addrinfo *backend_sa;
+struct addrinfo *frontend_sa;
+int frontend_port;
 
 static int stb_new(BIO *bi)
 {
@@ -113,7 +121,7 @@ void *handle_connection(conndata *data)
   if (!server_sock)
     goto cleanup;
 
-  if (st_connect(server_sock, (struct sockaddr *)(&backend_sa), sizeof(backend_sa), BACKEND_TIMEOUT))
+  if (st_connect(server_sock, backend_sa->ai_addr, backend_sa->ai_addrlen, BACKEND_CONNECT_TIMEOUT))
     goto cleanup;
 
   setsockopt(st_netfd_fileno(server_sock), IPPROTO_TCP, TCP_NODELAY, &size, sizeof(size));
@@ -128,9 +136,8 @@ void *handle_connection(conndata *data)
     buflen = snprintf(buffer, sizeof(buffer), "PROXY %s %s %s %u %u\r\n",
             (data->addr.sa_family == AF_INET6) ? "TCP6" : "TCP4",
             inet_ntop(data->addr_in->sin_family, &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
-            inet_ntop(server_sa.sin_family, &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
-            ntohs(data->addr_in->sin_port),
-            ntohs(server_sa.sin_port));
+            inet_ntop(frontend_sa->ai_family, &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
+            ntohs(data->addr_in->sin_port), frontend_port);
 
     do
     {
@@ -206,19 +213,48 @@ int default_process_count()
   return 16;
 }
 
+/*
+int new_session_cb(SSL *ssl, SSL_SESSION *in)
+{
+  char *serialized = NULL;
+  int length = i2d_SSL_SESSION(in, &serialized);
+}
+
+SSL_SESSION *get_session_cb(SSL *, unsigned char *, int, int *)
+{
+  return d2i_SSL_SESSION(SSL_SESSION **a, const unsigned char **pp, long length);
+}
+*/
+
+struct addrinfo *populate_sa(char *address)
+{
+  char hostname[256], service[256];
+  if (sscanf(address, " [%[0-9a-fA-F:]] : %s ", hostname, service) ||
+      sscanf(address, " %[0-9.] : %s ", hostname, service))
+  {
+    struct addrinfo hints, *res;
+    memset(&hints, '\0', sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    printf("%s : %s\n", hostname, service);
+    if (!getaddrinfo(hostname, service, &hints, &res) && res)
+      return res;
+  }
+  return NULL;
+}
+
 int main(int argc, char **argv)
 {
-  int s_port = 443;
-  // "RC4-MD5:RC4-SHA:RC4:MD5:SHA:ALL"
-  char cipher_list[1024] = "AES256-SHA:AES128-SHA:ALL";
-  char rsa_server_cert[1024] = "/etc/halbpd/server.crt";
-  char rsa_server_key[1024] = "/etc/halbpd/server.key";
-  char backend[1024] = "127.0.0.1:80";
+  char *config_file = DEFAULT_CONFIG_FILE;
+  char frontend[1024] = DEFAULT_FRONTEND;
+  char cipher_list[1024] = DEFAULT_CIPHER_LIST;
+  char rsa_server_cert[1024] = DEFAULT_CERT_FILE;
+  char rsa_server_key[1024] = DEFAULT_KEY_FILE;
+  char backend[1024] = DEFAULT_BACKEND;
   int listen_sock, process_count = 0;
   SSL_CTX *ctx;
   st_netfd_t listener, client;
-  char ip[16];
-  int port;
+  pid_t pid;
 
   BIO_METHOD methods_stbp =
   {
@@ -234,7 +270,9 @@ int main(int argc, char **argv)
     NULL,
   };
 
-  FILE *fp = fopen("/etc/halbpd/conf", "r");
+  if (argc > 1)
+    config_file = argv[1];
+  FILE *fp = fopen(config_file, "r");
   if (fp)
   {
     char line[1024];
@@ -242,31 +280,29 @@ int main(int argc, char **argv)
     {
       sscanf(line, " cert = %s ", rsa_server_cert);
       sscanf(line, " key = %s ", rsa_server_key);
-      sscanf(line, " port = %d ", &s_port);
       sscanf(line, " workers = %d ", &process_count);
       sscanf(line, " ciphers = %s ", cipher_list);
+      sscanf(line, " frontend = %s ", frontend);
       sscanf(line, " backend = %[^\n] ", backend);
     }
   }
   else
   {
-    fprintf(stderr, "Expected to find /etc/halbpd/conf like:\n"
-                    " # workers = 0\n"
-                    " # port = 443\n"
-                    " # ciphers = AES256-SHA:AES128-SHA:SHA1:ALL\n"
-                    " cert = /etc/halbpd/server.crt\n"
-                    " key = /etc/halbpd/server.key\n"
-                    " backend = 127.0.0.1:80\n");
+    fprintf(stderr, "Unable to find config file %s like:\n"
+                    "  # workers = 0\n"
+                    "  # ciphers = " DEFAULT_CIPHER_LIST "\n"
+                    "  # frontend = " DEFAULT_FRONTEND "\n"
+                    "  # backend = " DEFAULT_BACKEND "\n"
+                    "  cert = " DEFAULT_CERT_FILE "\n"
+                    "  key = " DEFAULT_KEY_FILE "\n", config_file);
     return 1;
   }
 
-  if (sscanf(backend, " %[^:] : %d ", ip, &port))
-  {
-    memset(&backend_sa, '\0', sizeof(server_sa));
-    backend_sa.sin_family = AF_INET;
-    backend_sa.sin_addr.s_addr = inet_addr(ip);
-    backend_sa.sin_port = htons(port);
-  }
+  backend_sa = populate_sa(backend);
+  frontend_sa = populate_sa(frontend);
+  frontend_port = ntohs((frontend_sa->ai_family == AF_INET) ?
+                        ((struct sockaddr_in*)frontend_sa->ai_addr)->sin_port :
+                        ((struct sockaddr_in6*)frontend_sa->ai_addr)->sin6_port);
 
   SSL_library_init();
   SSL_load_error_strings();
@@ -280,6 +316,7 @@ int main(int argc, char **argv)
     ERR_print_errors_fp(stderr);
     return 1;
   }
+  SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_BOTH | SSL_SESS_CACHE_NO_INTERNAL);
 
   if ((listen_sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) <= 0)
   {
@@ -294,12 +331,7 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  memset(&server_sa, '\0', sizeof(server_sa));
-  server_sa.sin_family = AF_INET;
-  server_sa.sin_addr.s_addr = INADDR_ANY;
-  server_sa.sin_port = htons(s_port);
-
-  if (bind(listen_sock, (struct sockaddr*)&server_sa, sizeof(server_sa)) < 0)
+  if (bind(listen_sock, (struct sockaddr*)&frontend_sa, sizeof(frontend_sa)) < 0)
   {
     perror("bind");
     return 1;
@@ -315,17 +347,45 @@ int main(int argc, char **argv)
     process_count = default_process_count();
   while (--process_count)
   {
-    if (!fork())
+    pid = fork();
+    if (!pid)
       break;
+    if (pid < 0)
+    {
+      perror("fork");
+      return 1;
+    }
   }
 
-  if (fork()) // daemonize
+  pid = fork();
+  if (pid < 0)
+  {
+    perror("fork");
+    return 1;
+  }
+  else if (pid)
     return 0;
-  setsid();
+
+  umask(077);
+  if (setsid() < 0)
+  {
+    perror("chdir");
+    return 1;
+  }
+
+  if (chdir("/"))
+  {
+    perror("chdir");
+    return 1;
+  }
+
+  close(STDIN_FILENO);
+  close(STDOUT_FILENO);
+  close(STDERR_FILENO);
 
   st_init();
   #if defined(ST_EVENTSYS_ALT)
-  st_set_eventsys(ST_EVENTSYS_ALT);
+    st_set_eventsys(ST_EVENTSYS_ALT);
   #endif
   st_randomize_stacks(1);
   listener = st_netfd_open_socket(listen_sock);
