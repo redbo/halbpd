@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <time.h>
+#include <sqlite3.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -34,6 +35,9 @@ typedef struct conndata {
 struct addrinfo *backend_sa;
 struct addrinfo *frontend_sa;
 int frontend_port;
+sqlite3 *sqlite_db;
+sqlite3_stmt *get_session, *set_session, *remove_session,
+             *cleanup_session, *update_session;
 
 static int stb_new(BIO *bi)
 {
@@ -206,25 +210,67 @@ int default_process_count()
     if (!strncmp(buf, "processor\t", 10))
       processors++;
   }
-  fprintf(stderr, "Starting up %d processes.\n", processors);
   fclose(fp);
   if (processors > 0 && processors <= 128)
     return processors * 2;
   return 16;
 }
 
-/*
-int new_session_cb(SSL *ssl, SSL_SESSION *in)
+long hash_id(unsigned char *id, int length)
 {
-  char *serialized = NULL;
-  int length = i2d_SSL_SESSION(in, &serialized);
+  unsigned long a = 1, b = 0, index = 0;
+  for (; index < length; index++)
+  {
+    a = (a + id[index]) % 65521;
+    b = (b + a) % 65521;
+  }
+  return (b << 16) | a;
 }
 
-SSL_SESSION *get_session_cb(SSL *, unsigned char *, int, int *)
+int new_session_cb(SSL *ssl, SSL_SESSION *sess)
 {
-  return d2i_SSL_SESSION(SSL_SESSION **a, const unsigned char **pp, long length);
+  unsigned char *serialized = NULL;
+  int length = i2d_SSL_SESSION(sess, NULL);
+
+  serialized = (unsigned char *)malloc(length);
+  length = i2d_SSL_SESSION(sess, &serialized);
+
+  sqlite3_reset(set_session);
+  sqlite3_bind_int64(set_session, 1, hash_id(sess->session_id, sess->session_id_length));
+  sqlite3_bind_int64(set_session, 2, time(NULL));
+  sqlite3_bind_blob(set_session, 3, serialized, length, free);
+  sqlite3_step(set_session);
+
+  return 1;
 }
-*/
+
+void remove_session_cb(SSL_CTX *ctx, SSL_SESSION *sess)
+{
+  sqlite3_reset(remove_session);
+  sqlite3_bind_int64(remove_session, 1, hash_id(sess->session_id, sess->session_id_length));
+  sqlite3_step(remove_session);
+}
+
+SSL_SESSION *get_session_cb(SSL *ssl, unsigned char *id, int id_length, int *copy)
+{
+  long session_id = hash_id(id, id_length);
+
+  sqlite3_reset(update_session);
+  sqlite3_bind_int64(update_session, 1, session_id);
+  sqlite3_step(remove_session);
+
+  sqlite3_reset(get_session);
+  sqlite3_bind_int64(get_session, 1, session_id);
+
+  if (sqlite3_step(get_session) == SQLITE_ROW)
+  {
+    SSL_SESSION *sess;
+    int pp_length = sqlite3_column_bytes(get_session, 1);
+    const unsigned char *pp = (unsigned char *)sqlite3_column_text(get_session, 1);
+    return d2i_SSL_SESSION(&sess, &pp, pp_length);
+  }
+  return NULL;
+}
 
 struct addrinfo *populate_sa(char *address)
 {
@@ -283,18 +329,19 @@ int main(int argc, char **argv)
       sscanf(line, " workers = %d ", &process_count);
       sscanf(line, " ciphers = %s ", cipher_list);
       sscanf(line, " frontend = %s ", frontend);
-      sscanf(line, " backend = %[^\n] ", backend);
+      sscanf(line, " backend = %s ", backend);
     }
   }
   else
   {
-    fprintf(stderr, "Unable to find config file %s like:\n"
-                    "  # workers = 0\n"
-                    "  # ciphers = " DEFAULT_CIPHER_LIST "\n"
-                    "  # frontend = " DEFAULT_FRONTEND "\n"
-                    "  # backend = " DEFAULT_BACKEND "\n"
-                    "  cert = " DEFAULT_CERT_FILE "\n"
-                    "  key = " DEFAULT_KEY_FILE "\n", config_file);
+    fprintf(stderr, "Unable to find config file %s\n"
+                    "It should look like:\n"
+                    "    # workers = 0\n"
+                    "    # ciphers = " DEFAULT_CIPHER_LIST "\n"
+                    "    # frontend = " DEFAULT_FRONTEND "\n"
+                    "    # backend = " DEFAULT_BACKEND "\n"
+                    "    cert = " DEFAULT_CERT_FILE "\n"
+                    "    key = " DEFAULT_KEY_FILE "\n", config_file);
     return 1;
   }
 
@@ -317,6 +364,9 @@ int main(int argc, char **argv)
     return 1;
   }
   SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_BOTH | SSL_SESS_CACHE_NO_INTERNAL);
+  SSL_CTX_sess_set_new_cb(ctx, new_session_cb);
+  SSL_CTX_sess_set_remove_cb(ctx, remove_session_cb);
+  SSL_CTX_sess_set_get_cb(ctx, get_session_cb);
 
   if ((listen_sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) <= 0)
   {
@@ -345,16 +395,19 @@ int main(int argc, char **argv)
 
   if (!process_count)
     process_count = default_process_count();
-  while (--process_count)
+  fprintf(stderr, "Starting up %d processes.\n", process_count);
+
+  umask(077);
+  if (setsid() < 0)
   {
-    pid = fork();
-    if (!pid)
-      break;
-    if (pid < 0)
-    {
-      perror("fork");
-      return 1;
-    }
+    perror("setsid");
+    return 1;
+  }
+
+  if (chdir("/"))
+  {
+    perror("chdir");
+    return 1;
   }
 
   pid = fork();
@@ -366,22 +419,40 @@ int main(int argc, char **argv)
   else if (pid)
     return 0;
 
-  umask(077);
-  if (setsid() < 0)
-  {
-    perror("chdir");
-    return 1;
-  }
-
-  if (chdir("/"))
-  {
-    perror("chdir");
-    return 1;
-  }
-
   close(STDIN_FILENO);
   close(STDOUT_FILENO);
   close(STDERR_FILENO);
+
+  while (--process_count)
+  {
+    pid = fork();
+    if (!pid)
+      break;
+    if (pid < 0)
+      return 1;
+  }
+
+  if (sqlite3_open("/dev/shm/halbpd", &sqlite_db))
+    return 1;
+  sqlite3_exec(sqlite_db, "PRAGMA synchronous = OFF", NULL, NULL, NULL);
+  sqlite3_exec(sqlite_db, "PRAGMA journal_mode = OFF", NULL, NULL, NULL);
+  sqlite3_exec(sqlite_db, "PRAGMA temp_store = MEMORY", NULL, NULL, NULL);
+  sqlite3_exec(sqlite_db, "CREATE TABLE IF NOT EXISTS sessions ("
+                           "id INTEGER PRIMARY KEY, "
+                           "last INTEGER KEY DEFAULT strftime('%s', 'now'), "
+                           "session TEXT)", NULL, NULL, NULL);
+
+  sqlite3_prepare_v2(sqlite_db, "SELECT * FROM sessions WHERE id=?",
+                     -1, &get_session, NULL);
+  sqlite3_prepare_v2(sqlite_db, "INSERT INTO sessions VALUES (?, ?, ?)",
+                     -1, &set_session, NULL);
+  sqlite3_prepare_v2(sqlite_db, "UPDATE sessions SET last = strftime('%s', 'now')"
+                     " WHERE id=?", -1, &update_session, NULL);
+  sqlite3_prepare_v2(sqlite_db, "DELETE FROM sessions WHERE id=?",
+                     -1, &remove_session, NULL);
+  sqlite3_prepare_v2(sqlite_db, "DELETE FROM sessions "
+                     "WHERE last < strftime('%s', 'now') - 36000",
+                     -1, &cleanup_session, NULL);
 
   st_init();
   #if defined(ST_EVENTSYS_ALT)
