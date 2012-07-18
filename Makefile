@@ -14,4 +14,4 @@ install: all
 	openssl req -new -x509 -nodes -sha1 -days 365 -subj '/CN=localhost' -key /etc/halbpd/server.key > /etc/halbpd/server.crt
 
 deb:
-	sudo checkinstall --requires 'libst1,libssl1.0.0,openssl'
+	sudo checkinstall --fstrans=no --requires 'libst1,libssl1.0.0'
