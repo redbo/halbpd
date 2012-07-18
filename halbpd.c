@@ -1,11 +1,11 @@
 #include <st.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <time.h>
-#include <sqlite3.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -14,17 +14,21 @@
 #include <openssl/crypto.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <sys/types.h>
+#include <pwd.h>
 
 #define BUFSIZE 16384
 #define STACKSIZE (1024 * 32) // 32 kb is enough for anyone
 #define TIMEOUT 60000000 // 60 seconds
 #define BACKEND_CONNECT_TIMEOUT 5000000 // 2 seconds
-#define DEFAULT_CONFIG_FILE "/etc/halbpd/conf"
+#define DEFAULT_CONFIG_FILE "/etc/halbpd/config"
 #define DEFAULT_CIPHER_LIST "AES128-SHA:AES:RC4:CAMELLIA128-SHA:!MD5:!ADH:!DH:!ECDH:!PSK:!SSLv2"
 #define DEFAULT_CERT_FILE "/etc/halbpd/server.crt"
 #define DEFAULT_KEY_FILE "/etc/halbpd/server.key"
 #define DEFAULT_BACKEND "127.0.0.1:80"
 #define DEFAULT_FRONTEND "0.0.0.0:443"
+#define DEFAULT_SESSION_STORE "/dev/shm"
+#define DEFAULT_USERNAME "root"
 
 typedef struct conndata {
   struct sockaddr addr;
@@ -35,9 +39,6 @@ typedef struct conndata {
 struct addrinfo *backend_sa;
 struct addrinfo *frontend_sa;
 int frontend_port;
-sqlite3 *sqlite_db;
-sqlite3_stmt *get_session, *set_session, *remove_session,
-             *cleanup_session, *update_session;
 
 static int stb_new(BIO *bi)
 {
@@ -138,22 +139,23 @@ void *handle_connection(conndata *data)
     SSL *ssl = data->ssl;
 
     buflen = snprintf(buffer, sizeof(buffer), "PROXY %s %s %s %u %u\r\n",
-            (data->addr.sa_family == AF_INET6) ? "TCP6" : "TCP4",
-            inet_ntop(data->addr_in->sin_family, &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
-            inet_ntop(frontend_sa->ai_family, &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
-            ntohs(data->addr_in->sin_port), frontend_port);
+                      (data->addr.sa_family == AF_INET6) ? "TCP6" : "TCP4",
+                      inet_ntop(data->addr_in->sin_family,
+                        &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
+                      inet_ntop(frontend_sa->ai_family,
+                        &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
+                      ntohs(data->addr_in->sin_port), frontend_port);
+    buflen = 0; // TODO remove this
 
     do
     {
-      bufpos = 0;
-      while (bufpos < buflen)
+      for (bufpos = 0; (bufpos < buflen); bufpos += wlen)
       {
         wlen = st_write(server_sock, buffer + bufpos, buflen - bufpos, TIMEOUT);
         if (wlen <= 0)
           goto client_to_server_cleanup;
-        bufpos += wlen;
       }
-    } while ((buflen = SSL_read(ssl, buffer, BUFSIZE)) > 0);
+    } while ((buflen = SSL_read(ssl, buffer, sizeof(buffer))) > 0);
 
     client_to_server_cleanup:
       st_thread_interrupt(s2c);
@@ -166,19 +168,17 @@ void *handle_connection(conndata *data)
     int bufpos = 0, buflen = 0, wlen = 0;
     SSL *ssl = data->ssl;
 
-    while ((buflen = st_read(server_sock, buffer + buflen, sizeof(buffer) - buflen, TIMEOUT)) > 0)
+    while ((buflen = st_read(server_sock, buffer, sizeof(buffer), TIMEOUT)) > 0)
     {
-      bufpos = 0;
-      while (bufpos < buflen)
+      for (bufpos = 0; (bufpos < buflen); bufpos += wlen)
       {
-        wlen = SSL_write(ssl, buffer, buflen);
+        wlen = SSL_write(ssl, buffer + bufpos, buflen - bufpos);
         if (wlen <= 0)
           goto server_to_client_cleanup;
-        bufpos += wlen;
       }
     }
     server_to_client_cleanup:
-      st_thread_interrupt(s2c);
+      st_thread_interrupt(c2s);
       return NULL;
   }
 
@@ -219,57 +219,12 @@ int default_process_count()
 long hash_id(unsigned char *id, int length)
 {
   unsigned long a = 1, b = 0, index = 0;
-  for (; index < length; index++)
+  for (; (index < length); index++)
   {
     a = (a + id[index]) % 65521;
     b = (b + a) % 65521;
   }
   return (b << 16) | a;
-}
-
-int new_session_cb(SSL *ssl, SSL_SESSION *sess)
-{
-  unsigned char *serialized = NULL;
-  int length = i2d_SSL_SESSION(sess, NULL);
-
-  serialized = (unsigned char *)malloc(length);
-  length = i2d_SSL_SESSION(sess, &serialized);
-
-  sqlite3_reset(set_session);
-  sqlite3_bind_int64(set_session, 1, hash_id(sess->session_id, sess->session_id_length));
-  sqlite3_bind_int64(set_session, 2, time(NULL));
-  sqlite3_bind_blob(set_session, 3, serialized, length, free);
-  sqlite3_step(set_session);
-
-  return 1;
-}
-
-void remove_session_cb(SSL_CTX *ctx, SSL_SESSION *sess)
-{
-  sqlite3_reset(remove_session);
-  sqlite3_bind_int64(remove_session, 1, hash_id(sess->session_id, sess->session_id_length));
-  sqlite3_step(remove_session);
-}
-
-SSL_SESSION *get_session_cb(SSL *ssl, unsigned char *id, int id_length, int *copy)
-{
-  long session_id = hash_id(id, id_length);
-
-  sqlite3_reset(update_session);
-  sqlite3_bind_int64(update_session, 1, session_id);
-  sqlite3_step(remove_session);
-
-  sqlite3_reset(get_session);
-  sqlite3_bind_int64(get_session, 1, session_id);
-
-  if (sqlite3_step(get_session) == SQLITE_ROW)
-  {
-    SSL_SESSION *sess;
-    int pp_length = sqlite3_column_bytes(get_session, 1);
-    const unsigned char *pp = (unsigned char *)sqlite3_column_text(get_session, 1);
-    return d2i_SSL_SESSION(&sess, &pp, pp_length);
-  }
-  return NULL;
 }
 
 struct addrinfo *populate_sa(char *address)
@@ -282,11 +237,39 @@ struct addrinfo *populate_sa(char *address)
     memset(&hints, '\0', sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
     printf("%s : %s\n", hostname, service);
     if (!getaddrinfo(hostname, service, &hints, &res) && res)
       return res;
   }
   return NULL;
+}
+
+void unlinker(void *filename)
+{
+  unlink(*(char **)filename);
+}
+
+SSL_CTX *ssl_init(char *cert, char *key, char *cipher_list)
+{
+  SSL_CTX *ctx;
+  SSL_library_init();
+  SSL_load_error_strings();
+
+  if (!(ctx = SSL_CTX_new(SSLv23_server_method())) ||
+      !SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_ALL) ||
+      !SSL_CTX_set_cipher_list(ctx, cipher_list) ||
+      (SSL_CTX_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) <= 0) ||
+      (SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) <= 0))
+  {
+    ERR_print_errors_fp(stderr);
+    fprintf(stderr, "cipherlist: %s\n", cipher_list);
+    fprintf(stderr, "cert file: %s\n", cert);
+    fprintf(stderr, "key file: %s\n", key);
+    return NULL;
+  }
+  SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+  return ctx;
 }
 
 int main(int argc, char **argv)
@@ -297,10 +280,11 @@ int main(int argc, char **argv)
   char rsa_server_cert[1024] = DEFAULT_CERT_FILE;
   char rsa_server_key[1024] = DEFAULT_KEY_FILE;
   char backend[1024] = DEFAULT_BACKEND;
+  char username[1024] = DEFAULT_USERNAME;
   int listen_sock, process_count = 0;
   SSL_CTX *ctx;
   st_netfd_t listener, client;
-  pid_t pid;
+  char __attribute__((cleanup(unlinker))) *db_file;
 
   BIO_METHOD methods_stbp =
   {
@@ -330,6 +314,7 @@ int main(int argc, char **argv)
       sscanf(line, " ciphers = %s ", cipher_list);
       sscanf(line, " frontend = %s ", frontend);
       sscanf(line, " backend = %s ", backend);
+      sscanf(line, " username = %s ", username);
     }
   }
   else
@@ -340,6 +325,7 @@ int main(int argc, char **argv)
                     "    # ciphers = " DEFAULT_CIPHER_LIST "\n"
                     "    # frontend = " DEFAULT_FRONTEND "\n"
                     "    # backend = " DEFAULT_BACKEND "\n"
+                    "    # username = " DEFAULT_USERNAME "\n"
                     "    cert = " DEFAULT_CERT_FILE "\n"
                     "    key = " DEFAULT_KEY_FILE "\n", config_file);
     return 1;
@@ -347,26 +333,13 @@ int main(int argc, char **argv)
 
   backend_sa = populate_sa(backend);
   frontend_sa = populate_sa(frontend);
-  frontend_port = ntohs((frontend_sa->ai_family == AF_INET) ?
-                        ((struct sockaddr_in*)frontend_sa->ai_addr)->sin_port :
-                        ((struct sockaddr_in6*)frontend_sa->ai_addr)->sin6_port);
+  if (frontend_sa->ai_family == AF_INET)
+    frontend_port = ntohs(((struct sockaddr_in*)frontend_sa->ai_addr)->sin_port);
+  else
+    frontend_port = ntohs(((struct sockaddr_in6*)frontend_sa->ai_addr)->sin6_port);
 
-  SSL_library_init();
-  SSL_load_error_strings();
-
-  if (!(ctx = SSL_CTX_new(SSLv23_server_method())) ||
-      !SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_ALL) ||
-      !SSL_CTX_set_cipher_list(ctx, cipher_list) ||
-      (SSL_CTX_use_certificate_file(ctx, rsa_server_cert, SSL_FILETYPE_PEM) <= 0) ||
-      (SSL_CTX_use_PrivateKey_file(ctx, rsa_server_key, SSL_FILETYPE_PEM) <= 0))
-  {
-    ERR_print_errors_fp(stderr);
+  if (!(ctx = ssl_init(rsa_server_cert, rsa_server_key, cipher_list)))
     return 1;
-  }
-  SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_BOTH | SSL_SESS_CACHE_NO_INTERNAL);
-  SSL_CTX_sess_set_new_cb(ctx, new_session_cb);
-  SSL_CTX_sess_set_remove_cb(ctx, remove_session_cb);
-  SSL_CTX_sess_set_get_cb(ctx, get_session_cb);
 
   if ((listen_sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) <= 0)
   {
@@ -381,7 +354,7 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  if (bind(listen_sock, (struct sockaddr*)&frontend_sa, sizeof(frontend_sa)) < 0)
+  if (bind(listen_sock, frontend_sa->ai_addr, frontend_sa->ai_addrlen) != 0)
   {
     perror("bind");
     return 1;
@@ -389,70 +362,37 @@ int main(int argc, char **argv)
 
   if (listen(listen_sock, SOMAXCONN) < 0)
   {
-    perror("bind");
+    perror("listen");
     return 1;
   }
+
+  struct passwd *pw = getpwnam(username);
+  if (pw)
+  {
+    setuid(pw->pw_uid);
+    setgid(pw->pw_gid);
+  }
+
+  umask(077);
 
   if (!process_count)
     process_count = default_process_count();
   fprintf(stderr, "Starting up %d processes.\n", process_count);
 
-  umask(077);
-  if (setsid() < 0)
+  if (daemon(0, 0) < 0)
   {
-    perror("setsid");
+    perror("daemon");
     return 1;
   }
-
-  if (chdir("/"))
-  {
-    perror("chdir");
-    return 1;
-  }
-
-  pid = fork();
-  if (pid < 0)
-  {
-    perror("fork");
-    return 1;
-  }
-  else if (pid)
-    return 0;
-
-  close(STDIN_FILENO);
-  close(STDOUT_FILENO);
-  close(STDERR_FILENO);
 
   while (--process_count)
   {
-    pid = fork();
-    if (!pid)
+    pid_t pid;
+    if (!(pid = fork()))
       break;
     if (pid < 0)
       return 1;
   }
-
-  if (sqlite3_open("/dev/shm/halbpd", &sqlite_db))
-    return 1;
-  sqlite3_exec(sqlite_db, "PRAGMA synchronous = OFF", NULL, NULL, NULL);
-  sqlite3_exec(sqlite_db, "PRAGMA journal_mode = OFF", NULL, NULL, NULL);
-  sqlite3_exec(sqlite_db, "PRAGMA temp_store = MEMORY", NULL, NULL, NULL);
-  sqlite3_exec(sqlite_db, "CREATE TABLE IF NOT EXISTS sessions ("
-                           "id INTEGER PRIMARY KEY, "
-                           "last INTEGER KEY DEFAULT strftime('%s', 'now'), "
-                           "session TEXT)", NULL, NULL, NULL);
-
-  sqlite3_prepare_v2(sqlite_db, "SELECT * FROM sessions WHERE id=?",
-                     -1, &get_session, NULL);
-  sqlite3_prepare_v2(sqlite_db, "INSERT INTO sessions VALUES (?, ?, ?)",
-                     -1, &set_session, NULL);
-  sqlite3_prepare_v2(sqlite_db, "UPDATE sessions SET last = strftime('%s', 'now')"
-                     " WHERE id=?", -1, &update_session, NULL);
-  sqlite3_prepare_v2(sqlite_db, "DELETE FROM sessions WHERE id=?",
-                     -1, &remove_session, NULL);
-  sqlite3_prepare_v2(sqlite_db, "DELETE FROM sessions "
-                     "WHERE last < strftime('%s', 'now') - 36000",
-                     -1, &cleanup_session, NULL);
 
   st_init();
   #if defined(ST_EVENTSYS_ALT)

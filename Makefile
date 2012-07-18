@@ -1,8 +1,17 @@
 all:
-	gcc -O3 -fomit-frame-pointer -march=opteron -msse -msse2 -msse3 -mfpmath=sse -s -Wall -Werror -o halbpd halbpd.c -lssl -lst -L. -lm -lsqlite3
-#	gcc -g -Wall -Werror -o halbpd halbpd.c -lssl -lst -L. -lm
+	gcc -O3 -fomit-frame-pointer -msse -msse2 -msse3 -mfpmath=sse -s -Wall -Werror -o halbpd halbpd.c -lssl -lst
+#	gcc -g -Wall -Werror -o halbpd halbpd.c -lssl -lst
 
 keys:
 	openssl genrsa 1024 > server.key
 	openssl req -new -x509 -nodes -sha1 -days 365 -subj '/CN=localhost' -key ./server.key > server.crt
 
+install: all
+	mv halbpd /usr/local/bin
+	mkdir -p /etc/halbpd
+	cp config.sample /etc/halbpd/config
+	openssl genrsa 1024 > /etc/halbpd/server.key
+	openssl req -new -x509 -nodes -sha1 -days 365 -subj '/CN=localhost' -key /etc/halbpd/server.key > /etc/halbpd/server.crt
+
+deb:
+	sudo checkinstall --requires 'libst1,libssl1.0.0,openssl'
