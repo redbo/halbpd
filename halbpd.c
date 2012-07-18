@@ -12,6 +12,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <openssl/crypto.h>
+#include <openssl/engine.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <sys/types.h>
@@ -29,6 +30,7 @@
 #define DEFAULT_FRONTEND "0.0.0.0:443"
 #define DEFAULT_SESSION_STORE "/dev/shm"
 #define DEFAULT_USERNAME "root"
+#define DEFAULT_ENGINE "aesni"
 
 typedef struct conndata {
   struct sockaddr addr;
@@ -272,6 +274,29 @@ SSL_CTX *ssl_init(char *cert, char *key, char *cipher_list)
   return ctx;
 }
 
+int set_ssl_engine(char *engine)
+{
+  ENGINE *e = ENGINE_by_id(engine);
+  if (!e)
+  {
+    fprintf(stderr, "Unable to find engine: %s\n", engine);
+    return 0;
+  }
+  if (!ENGINE_init(e))
+  {
+    fprintf(stderr, "Unable to init engine\n");
+    ENGINE_free(e);
+    return 0;
+  }
+  if (!ENGINE_set_default(e, ENGINE_METHOD_ALL))
+  {
+    fprintf(stderr, "Unable to ENGINE_set_default\n");
+    ENGINE_free(e);
+    return 0;
+  }
+  return 1;
+}
+
 int main(int argc, char **argv)
 {
   char *config_file = DEFAULT_CONFIG_FILE;
@@ -281,6 +306,7 @@ int main(int argc, char **argv)
   char rsa_server_key[1024] = DEFAULT_KEY_FILE;
   char backend[1024] = DEFAULT_BACKEND;
   char username[1024] = DEFAULT_USERNAME;
+  char engine[1024] = DEFAULT_ENGINE;
   int listen_sock, process_count = 0;
   SSL_CTX *ctx;
   st_netfd_t listener, client;
@@ -312,6 +338,7 @@ int main(int argc, char **argv)
       sscanf(line, " key = %s ", rsa_server_key);
       sscanf(line, " workers = %d ", &process_count);
       sscanf(line, " ciphers = %s ", cipher_list);
+      sscanf(line, " engine = %s ", engine);
       sscanf(line, " frontend = %s ", frontend);
       sscanf(line, " backend = %s ", backend);
       sscanf(line, " username = %s ", username);
@@ -323,6 +350,7 @@ int main(int argc, char **argv)
                     "It should look like:\n"
                     "    # workers = 0\n"
                     "    # ciphers = " DEFAULT_CIPHER_LIST "\n"
+                    "    # engine = " DEFAULT_ENGINE "\n"
                     "    # frontend = " DEFAULT_FRONTEND "\n"
                     "    # backend = " DEFAULT_BACKEND "\n"
                     "    # username = " DEFAULT_USERNAME "\n"
@@ -337,6 +365,9 @@ int main(int argc, char **argv)
     frontend_port = ntohs(((struct sockaddr_in*)frontend_sa->ai_addr)->sin_port);
   else
     frontend_port = ntohs(((struct sockaddr_in6*)frontend_sa->ai_addr)->sin6_port);
+
+  if (!set_ssl_engine(engine))
+    return 1;
 
   if (!(ctx = ssl_init(rsa_server_cert, rsa_server_key, cipher_list)))
     return 1;
