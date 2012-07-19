@@ -312,6 +312,7 @@ int main(int argc, char **argv)
       sscanf(line, " frontend = %s ", frontend);
       sscanf(line, " backend = %s ", backend);
       sscanf(line, " username = %s ", username);
+      sscanf(line, " proxymode = %s ", proxymode);
     }
   }
   else
