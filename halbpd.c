@@ -29,7 +29,9 @@
 #define DEFAULT_FRONTEND "0.0.0.0:443"
 #define DEFAULT_SESSION_STORE "/dev/shm"
 #define DEFAULT_USERNAME "root"
-#define DEFAULT_PROXY_MODE "true"
+#define DEFAULT_PROXY_MODE "enabled"
+
+#define CHECKRESPONSE(x, y) if ((y) < 0) {perror((x));exit(1);}
 
 typedef struct conndata {
   struct sockaddr addr;
@@ -40,7 +42,7 @@ typedef struct conndata {
 struct addrinfo *backend_sa;
 struct addrinfo *frontend_sa;
 int frontend_port;
-int proxy_mode;
+int haproxy_mode;
 
 static int stb_new(BIO *bi)
 {
@@ -140,7 +142,7 @@ void *handle_connection(conndata *data)
     int bufpos = 0, buflen = 0, wlen = 0;
     SSL *ssl = data->ssl;
 
-    if (proxy_mode)
+    if (haproxy_mode)
       buflen = snprintf(buffer, sizeof(buffer), "PROXY %s %s %s %u %u\r\n",
                         (data->addr.sa_family == AF_INET6) ? "TCP6" : "TCP4",
                         inet_ntop(data->addr_in->sin_family,
@@ -279,9 +281,11 @@ int main(int argc, char **argv)
   char backend[1024] = DEFAULT_BACKEND;
   char username[1024] = DEFAULT_USERNAME;
   char proxymode[1024] = DEFAULT_PROXY_MODE;
-  int listen_sock, process_count = 0;
-  SSL_CTX *ctx;
-  st_netfd_t listener, client;
+  int listen_sock = 0, process_count = 0, sockopt = 1;
+  struct passwd *pw = NULL;
+  SSL_CTX *ctx = NULL;
+  st_netfd_t listener = NULL, client = NULL;
+  FILE *fp = NULL;
 
   BIO_METHOD methods_stbp =
   {
@@ -299,8 +303,7 @@ int main(int argc, char **argv)
 
   if (argc > 1)
     config_file = argv[1];
-  FILE *fp = fopen(config_file, "r");
-  if (fp)
+  if ((fp = fopen(config_file, "r")))
   {
     char line[1024];
     while (fgets(line, sizeof(line), fp))
@@ -340,53 +343,26 @@ int main(int argc, char **argv)
   if (!(ctx = ssl_init(rsa_server_cert, rsa_server_key, cipher_list)))
     return 1;
 
-  if ((listen_sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) <= 0)
-  {
-    perror("socket");
-    return 1;
-  }
-
-  int x = 1;
-  if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (char *) &x, sizeof(x)) < 0)
-  {
-    perror("setsockopt");
-    return 1;
-  }
-
-  if (bind(listen_sock, frontend_sa->ai_addr, frontend_sa->ai_addrlen) != 0)
-  {
-    perror("bind");
-    return 1;
-  }
-
-  if (listen(listen_sock, SOMAXCONN) < 0)
-  {
-    perror("listen");
-    return 1;
-  }
-
-  proxy_mode = !strcasecmp(proxymode, "true") || !strcasecmp(proxymode, "t") ||
-               !strcasecmp(proxymode, "on") || !strcasecmp(proxymode, "enabled");
-
-  struct passwd *pw = getpwnam(username);
-  if (pw)
-  {
-    setuid(pw->pw_uid);
-    setgid(pw->pw_gid);
-  }
-
-  umask(077);
+  haproxy_mode = !strcasecmp(proxymode, "true") || !strcasecmp(proxymode, "t") ||
+                 !strcasecmp(proxymode, "on") || !strcasecmp(proxymode, "enabled");
 
   if (!process_count)
     process_count = default_process_count();
-  fprintf(stderr, "Starting up %d processes.\n", process_count);
-  fprintf(stderr, "Proxy mode: %s\n", proxy_mode ? "enabled" : "disabled");
 
-  if (daemon(0, 0) < 0)
+  umask(077);
+
+  CHECKRESPONSE("socket", listen_sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP))
+  CHECKRESPONSE("setsockopt", setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (char *) &sockopt, sizeof(sockopt)))
+  CHECKRESPONSE("bind", bind(listen_sock, frontend_sa->ai_addr, frontend_sa->ai_addrlen))
+  CHECKRESPONSE("listen", listen(listen_sock, SOMAXCONN))
+
+  if ((pw = getpwnam(username)))
   {
-    perror("daemon");
-    return 1;
+    CHECKRESPONSE("setuid", setuid(pw->pw_uid))
+    CHECKRESPONSE("setgid", setgid(pw->pw_gid))
   }
+
+  CHECKRESPONSE("daemon", daemon(0, 0))
 
   while (--process_count)
   {
