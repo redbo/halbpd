@@ -29,6 +29,7 @@
 #define DEFAULT_FRONTEND "0.0.0.0:443"
 #define DEFAULT_SESSION_STORE "/dev/shm"
 #define DEFAULT_USERNAME "root"
+#define DEFAULT_PROXY_MODE "true"
 
 typedef struct conndata {
   struct sockaddr addr;
@@ -39,6 +40,7 @@ typedef struct conndata {
 struct addrinfo *backend_sa;
 struct addrinfo *frontend_sa;
 int frontend_port;
+int proxy_mode;
 
 static int stb_new(BIO *bi)
 {
@@ -138,14 +140,14 @@ void *handle_connection(conndata *data)
     int bufpos = 0, buflen = 0, wlen = 0;
     SSL *ssl = data->ssl;
 
-    buflen = snprintf(buffer, sizeof(buffer), "PROXY %s %s %s %u %u\r\n",
-                      (data->addr.sa_family == AF_INET6) ? "TCP6" : "TCP4",
-                      inet_ntop(data->addr_in->sin_family,
-                        &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
-                      inet_ntop(frontend_sa->ai_family,
-                        &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
-                      ntohs(data->addr_in->sin_port), frontend_port);
-    buflen = 0; // TODO remove this
+    if (proxy_mode)
+      buflen = snprintf(buffer, sizeof(buffer), "PROXY %s %s %s %u %u\r\n",
+                        (data->addr.sa_family == AF_INET6) ? "TCP6" : "TCP4",
+                        inet_ntop(data->addr_in->sin_family,
+                          &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
+                        inet_ntop(frontend_sa->ai_family,
+                          &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
+                        ntohs(data->addr_in->sin_port), frontend_port);
 
     do
     {
@@ -245,11 +247,6 @@ struct addrinfo *populate_sa(char *address)
   return NULL;
 }
 
-void unlinker(void *filename)
-{
-  unlink(*(char **)filename);
-}
-
 SSL_CTX *ssl_init(char *cert, char *key, char *cipher_list)
 {
   SSL_CTX *ctx;
@@ -281,10 +278,10 @@ int main(int argc, char **argv)
   char rsa_server_key[1024] = DEFAULT_KEY_FILE;
   char backend[1024] = DEFAULT_BACKEND;
   char username[1024] = DEFAULT_USERNAME;
+  char proxymode[1024] = DEFAULT_PROXY_MODE;
   int listen_sock, process_count = 0;
   SSL_CTX *ctx;
   st_netfd_t listener, client;
-  char __attribute__((cleanup(unlinker))) *db_file;
 
   BIO_METHOD methods_stbp =
   {
@@ -326,6 +323,7 @@ int main(int argc, char **argv)
                     "    # frontend = " DEFAULT_FRONTEND "\n"
                     "    # backend = " DEFAULT_BACKEND "\n"
                     "    # username = " DEFAULT_USERNAME "\n"
+                    "    # proxymode = " DEFAULT_PROXY_MODE "\n"
                     "    cert = " DEFAULT_CERT_FILE "\n"
                     "    key = " DEFAULT_KEY_FILE "\n", config_file);
     return 1;
@@ -366,6 +364,9 @@ int main(int argc, char **argv)
     return 1;
   }
 
+  proxy_mode = !strcasecmp(proxymode, "true") || !strcasecmp(proxymode, "t") ||
+               !strcasecmp(proxymode, "on") || !strcasecmp(proxymode, "enabled");
+
   struct passwd *pw = getpwnam(username);
   if (pw)
   {
@@ -378,6 +379,7 @@ int main(int argc, char **argv)
   if (!process_count)
     process_count = default_process_count();
   fprintf(stderr, "Starting up %d processes.\n", process_count);
+  fprintf(stderr, "Proxy mode: %s\n", proxy_mode ? "enabled" : "disabled");
 
   if (daemon(0, 0) < 0)
   {
