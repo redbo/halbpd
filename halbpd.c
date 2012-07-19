@@ -369,13 +369,14 @@ int main(int argc, char **argv)
 
   for (;;)
   {
+    int adlen, client_sock, size;
     conndata *data = (conndata *)malloc(sizeof(conndata));
-    int adlen = sizeof(data->addr);
+    adlen = sizeof(data->addr);
     if ((client = st_accept(listener, (struct sockaddr*)&(data->addr), &adlen, TIMEOUT)))
     {
       data->addr_in = (struct sockaddr_in *)&(data->addr);
-      int client_sock = st_netfd_fileno(client);
-      int size = 1;
+      client_sock = st_netfd_fileno(client);
+      size = 1;
       st_netfd_free(client);
       setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, &size, sizeof(size));
       if (client_sock >= 0)
