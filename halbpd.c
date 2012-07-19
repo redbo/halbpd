@@ -17,8 +17,8 @@
 #include <sys/types.h>
 #include <pwd.h>
 
-#define BUFSIZE 16384
-#define STACKSIZE (1024 * 32) // 32 kb is enough for anyone
+#define BUFSIZE 32768
+#define STACKSIZE (1024 * 64) // 64 kb is enough for anyone
 #define TIMEOUT 60000000 // 60 seconds
 #define BACKEND_CONNECT_TIMEOUT 5000000 // 2 seconds
 #define DEFAULT_CONFIG_FILE "/etc/halbpd/config"
