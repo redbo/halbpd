@@ -117,9 +117,7 @@ static long stb_ctrl(BIO *b, int cmd, long num, void *ptr)
 void *handle_connection(conndata *data)
 {
   int size = 1;
-  st_thread_t c2s;
-  st_thread_t s2c;
-
+  st_thread_t c2s, s2c;
   int sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 
   if (sock < 0)
