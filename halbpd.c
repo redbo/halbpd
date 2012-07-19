@@ -220,17 +220,6 @@ int default_process_count()
   return 16;
 }
 
-long hash_id(unsigned char *id, int length)
-{
-  unsigned long a = 1, b = 0, index = 0;
-  for (; (index < length); index++)
-  {
-    a = (a + id[index]) % 65521;
-    b = (b + a) % 65521;
-  }
-  return (b << 16) | a;
-}
-
 struct addrinfo *populate_sa(char *address)
 {
   char hostname[256], service[256];
