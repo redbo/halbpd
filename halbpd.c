@@ -297,7 +297,7 @@ int main(int argc, char **argv)
       sscanf(line, " frontend = %s ", frontend);
       sscanf(line, " backend = %s ", backend);
       sscanf(line, " username = %s ", username);
-      sscanf(line, " proxymode = %s ", proxymode);
+      sscanf(line, " haproxymode = %s ", proxymode);
     }
   }
   else
@@ -309,7 +309,7 @@ int main(int argc, char **argv)
                     "    frontend = " DEFAULT_FRONTEND "\n"
                     "    backend = " DEFAULT_BACKEND "\n"
                     "    username = " DEFAULT_USERNAME "\n"
-                    "    proxymode = " DEFAULT_PROXY_MODE "\n"
+                    "    haproxymode = " DEFAULT_PROXY_MODE "\n"
                     "    cert = " DEFAULT_CERT_FILE "\n"
                     "    key = " DEFAULT_KEY_FILE "\n", config_file);
     return 1;

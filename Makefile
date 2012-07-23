@@ -1,5 +1,5 @@
 all:
-	gcc -O3 -fomit-frame-pointer -msse -msse2 -msse3 -mfpmath=sse -s -Wall -Werror -o halbpd halbpd.c -lssl -lst -ljemalloc
+	gcc -O3 -fomit-frame-pointer -msse -msse2 -msse3 -mfpmath=sse -s -Wall -Werror -o halbpd halbpd.c -lssl -lst
 #	gcc -g -Wall -Werror -o halbpd halbpd.c -lssl -lst
 
 keys:
