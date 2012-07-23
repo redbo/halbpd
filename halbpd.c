@@ -304,12 +304,12 @@ int main(int argc, char **argv)
   {
     fprintf(stderr, "Unable to find config file %s\n"
                     "It should look like:\n"
-                    "    # workers = 0\n"
-                    "    # ciphers = " DEFAULT_CIPHER_LIST "\n"
-                    "    # frontend = " DEFAULT_FRONTEND "\n"
-                    "    # backend = " DEFAULT_BACKEND "\n"
-                    "    # username = " DEFAULT_USERNAME "\n"
-                    "    # proxymode = " DEFAULT_PROXY_MODE "\n"
+                    "    workers = 0\n"
+                    "    ciphers = " DEFAULT_CIPHER_LIST "\n"
+                    "    frontend = " DEFAULT_FRONTEND "\n"
+                    "    backend = " DEFAULT_BACKEND "\n"
+                    "    username = " DEFAULT_USERNAME "\n"
+                    "    proxymode = " DEFAULT_PROXY_MODE "\n"
                     "    cert = " DEFAULT_CERT_FILE "\n"
                     "    key = " DEFAULT_KEY_FILE "\n", config_file);
     return 1;
