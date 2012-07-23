@@ -149,15 +149,16 @@ void *handle_connection(conndata *data)
                           &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
                         ntohs(data->addr_in->sin_port), frontend_port);
 
+    buflen += SSL_read(ssl, &buffer[buflen], sizeof(buffer) - buflen);
     do
     {
       for (bufpos = 0; (bufpos < buflen); bufpos += wlen)
       {
-        wlen = st_write(server_sock, buffer + bufpos, buflen - bufpos, TIMEOUT);
-        if (wlen <= 0)
+        if ((wlen = st_write(server_sock, buffer + bufpos, buflen - bufpos, TIMEOUT)) < 0)
           goto client_to_server_cleanup;
       }
-    } while ((buflen = SSL_read(ssl, buffer, sizeof(buffer))) > 0);
+    }
+    while ((buflen = SSL_read(ssl, buffer, sizeof(buffer))) > 0);
 
     client_to_server_cleanup:
       st_thread_interrupt(s2c);
@@ -174,8 +175,7 @@ void *handle_connection(conndata *data)
     {
       for (bufpos = 0; (bufpos < buflen); bufpos += wlen)
       {
-        wlen = SSL_write(ssl, buffer + bufpos, buflen - bufpos);
-        if (wlen <= 0)
+        if ((wlen = SSL_write(ssl, buffer + bufpos, buflen - bufpos)) < 0)
           goto server_to_client_cleanup;
       }
     }
@@ -229,32 +229,43 @@ struct addrinfo *populate_sa(char *address)
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
-    printf("%s : %s\n", hostname, service);
     if (!getaddrinfo(hostname, service, &hints, &res) && res)
       return res;
   }
   return NULL;
 }
 
+int new_session_cb(struct ssl_st *ssl, SSL_SESSION *sess)
+{
+  fprintf(stderr, "new_session_cb\n");
+  return 0;
+}
+void remove_session_cb(struct ssl_ctx_st *ctx, SSL_SESSION *sess)
+{
+  fprintf(stderr, "remove_session_cb\n");
+}
+SSL_SESSION *get_session_cb(struct ssl_st *ssl, unsigned char *data,
+                  int len, int *copy)
+{
+  fprintf(stderr, "get_session_cb\n");
+  return NULL;
+}
+
+#define CHECKSSL(x) if (x) {ERR_print_errors_fp(stderr); exit(1);}
 SSL_CTX *ssl_init(char *cert, char *key, char *cipher_list)
 {
   SSL_CTX *ctx;
   SSL_library_init();
   SSL_load_error_strings();
 
-  if (!(ctx = SSL_CTX_new(SSLv23_server_method())) ||
-      !SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_ALL) ||
-      !SSL_CTX_set_cipher_list(ctx, cipher_list) ||
-      (SSL_CTX_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) <= 0) ||
-      (SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) <= 0))
-  {
-    ERR_print_errors_fp(stderr);
-    fprintf(stderr, "cipherlist: %s\n", cipher_list);
-    fprintf(stderr, "cert file: %s\n", cert);
-    fprintf(stderr, "key file: %s\n", key);
-    return NULL;
-  }
+  CHECKSSL(!(ctx = SSL_CTX_new(SSLv23_server_method())))
+  CHECKSSL(!SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_ALL))
+  CHECKSSL(!SSL_CTX_set_cipher_list(ctx, cipher_list))
+  CHECKSSL(SSL_CTX_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) <= 0)
+  CHECKSSL(SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) <= 0)
   SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+  SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
+
   return ctx;
 }
 
@@ -349,6 +360,7 @@ int main(int argc, char **argv)
     CHECKRESPONSE("setgid", setgid(pw->pw_gid))
   }
 
+/*
   CHECKRESPONSE("daemon", daemon(0, 0))
 
   while (--process_count)
@@ -359,6 +371,7 @@ int main(int argc, char **argv)
     if (pid < 0)
       return 1;
   }
+*/
 
   st_init();
   #if defined(ST_EVENTSYS_ALT)
