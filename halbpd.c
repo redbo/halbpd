@@ -235,22 +235,6 @@ struct addrinfo *populate_sa(char *address)
   return NULL;
 }
 
-int new_session_cb(struct ssl_st *ssl, SSL_SESSION *sess)
-{
-  fprintf(stderr, "new_session_cb\n");
-  return 0;
-}
-void remove_session_cb(struct ssl_ctx_st *ctx, SSL_SESSION *sess)
-{
-  fprintf(stderr, "remove_session_cb\n");
-}
-SSL_SESSION *get_session_cb(struct ssl_st *ssl, unsigned char *data,
-                  int len, int *copy)
-{
-  fprintf(stderr, "get_session_cb\n");
-  return NULL;
-}
-
 #define CHECKSSL(x) if (x) {ERR_print_errors_fp(stderr); exit(1);}
 SSL_CTX *ssl_init(char *cert, char *key, char *cipher_list)
 {
@@ -360,7 +344,6 @@ int main(int argc, char **argv)
     CHECKRESPONSE("setgid", setgid(pw->pw_gid))
   }
 
-/*
   CHECKRESPONSE("daemon", daemon(0, 0))
 
   while (--process_count)
@@ -371,7 +354,6 @@ int main(int argc, char **argv)
     if (pid < 0)
       return 1;
   }
-*/
 
   st_init();
   #if defined(ST_EVENTSYS_ALT)
