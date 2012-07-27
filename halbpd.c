@@ -214,7 +214,7 @@ int default_process_count()
   }
   fclose(fp);
   if (processors > 0 && processors <= 128)
-    return processors * 2;
+    return processors;
   return 16;
 }
 
