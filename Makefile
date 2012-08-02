@@ -1,5 +1,4 @@
 all:
-#	gcc -O3 -fomit-frame-pointer -msse4.2 -s -Wall -Werror -o halbpd halbpd.c -lssl -lst -ljemalloc
 	gcc -O3 -fomit-frame-pointer -mcpu=corei7-avx -s -Wall -Werror -o halbpd halbpd.c -lssl -lst -ljemalloc
 #	gcc -g -Wall -Werror -o halbpd halbpd.c -lssl -lst
 

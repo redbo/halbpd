@@ -21,10 +21,10 @@
 #include <sys/mman.h>
 
 #define BUFSIZE 32768
-#define STACKSIZE (1024 * 16) // 16 kb is enough for anyone
-#define TIMEOUT 60000000 // 60 seconds
+#define STACKSIZE (1024 * 8) // 8 kb is enough for anyone
+#define TIMEOUT 120000000 // 120 seconds
 #define LISTEN_QUEUE 1024
-#define BACKEND_CONNECT_TIMEOUT 5000000 // 2 seconds
+#define BACKEND_CONNECT_TIMEOUT 10000000 // 10 seconds
 #define DEFAULT_CONFIG_FILE "/etc/halbpd/config"
 #define DEFAULT_CIPHER_LIST "AES128-SHA:AES:RC4:CAMELLIA128-SHA:!MD5:!ADH:!DH:!ECDH:!PSK:!SSLv2"
 #define DEFAULT_CERT_FILE "/etc/halbpd/server.crt"
@@ -34,21 +34,20 @@
 #define DEFAULT_SESSION_STORE "/dev/shm"
 #define DEFAULT_USERNAME "root"
 #define DEFAULT_PROXY_MODE "enabled"
-#define MAX_FILES 8192
+#define MAX_FILES 16384
 
 #define CHECKRESPONSE(x, y) if ((y) < 0) {perror((x));exit(1);}
 
 typedef struct conndata {
-  struct sockaddr addr;
   struct sockaddr_in *addr_in;
   SSL *ssl;
+  struct conndata *next;
   char c2sbuf[BUFSIZE];
   char s2cbuf[BUFSIZE];
-  struct conndata *next;
+  struct sockaddr addr;
 } conndata;
 
-struct addrinfo *backend_sa;
-struct addrinfo *frontend_sa;
+struct addrinfo *backend_sa, *frontend_sa;
 int frontend_port;
 int haproxy_mode;
 conndata *conndata_list = NULL;
@@ -147,11 +146,12 @@ void *handle_connection(conndata *data)
 
   void *client_to_server(void *arg)
   {
+    char *buffer = data->c2sbuf;
     char ipbuf[48];
     int bufpos = 0, buflen = 0, wlen = 0;
 
     if (haproxy_mode)
-      buflen = snprintf(data->c2sbuf, sizeof(data->c2sbuf), "PROXY %s %s %s %u %u\r\n",
+      buflen = snprintf(buffer, BUFSIZE, "PROXY %s %s %s %u %u\r\n",
                         (data->addr.sa_family == AF_INET6) ? "TCP6" : "TCP4",
                         inet_ntop(data->addr_in->sin_family,
                           &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
@@ -159,16 +159,18 @@ void *handle_connection(conndata *data)
                           &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
                         ntohs(data->addr_in->sin_port), frontend_port);
 
-    buflen += SSL_read(ssl, data->c2sbuf + buflen, sizeof(data->c2sbuf) - buflen);
+    if ((wlen = SSL_read(ssl, buffer + buflen, BUFSIZE - buflen)) < 0)
+      goto client_to_server_cleanup;
+    buflen += wlen;
     do
     {
       for (bufpos = 0; (bufpos < buflen); bufpos += wlen)
       {
-        if ((wlen = st_write(server_sock, data->c2sbuf + bufpos, buflen - bufpos, TIMEOUT)) < 0)
+        if ((wlen = st_write(server_sock, buffer + bufpos, buflen - bufpos, TIMEOUT)) < 0)
           goto client_to_server_cleanup;
       }
     }
-    while ((buflen = SSL_read(ssl, data->c2sbuf, sizeof(data->c2sbuf))) > 0);
+    while ((buflen = SSL_read(ssl, buffer, BUFSIZE)) > 0);
 
     client_to_server_cleanup:
       st_thread_interrupt(s2c);
@@ -177,13 +179,14 @@ void *handle_connection(conndata *data)
 
   void *server_to_client(void *arg)
   {
+    char *buffer = data->s2cbuf;
     int bufpos = 0, buflen = 0, wlen = 0;
 
-    while ((buflen = st_read(server_sock, data->s2cbuf, sizeof(data->s2cbuf), TIMEOUT)) > 0)
+    while ((buflen = st_read(server_sock, buffer, BUFSIZE, TIMEOUT)) > 0)
     {
       for (bufpos = 0; (bufpos < buflen); bufpos += wlen)
       {
-        if ((wlen = SSL_write(ssl, data->s2cbuf + bufpos, buflen - bufpos)) < 0)
+        if ((wlen = SSL_write(ssl, buffer + bufpos, buflen - bufpos)) < 0)
           goto server_to_client_cleanup;
       }
     }
@@ -264,14 +267,14 @@ SSL_CTX *ssl_init(char *cert, char *key, char *cipher_list)
   if (e)
   {
     ENGINE_init(e);
+    ENGINE_ctrl_cmd_string(e, "THREAD_LOCKING", "0", 0);
+    ENGINE_ctrl_cmd_string(e, "FORK_CHECK", "0", 0);
     ENGINE_set_default_RSA(e);
     ENGINE_set_default_DSA(e);
     ENGINE_set_default(e, ENGINE_METHOD_ALL);
   }
   else
     fprintf(stderr, "Unable to load aesni engine.\n");
-  ENGINE_ctrl_cmd_string(e, "THREAD_LOCKING", "0", 0);
-  ENGINE_ctrl_cmd_string(e, "FORK_CHECK", "0", 0);
   return ctx;
 }
 
@@ -410,10 +413,7 @@ int main(int argc, char **argv)
       conndata_list = data->next;
     }
     else
-    {
       data = (conndata *)malloc(sizeof(conndata));
-      data->next = NULL;
-    }
     adlen = sizeof(data->addr);
     if ((client = st_accept(listener, (struct sockaddr*)&(data->addr), &adlen, TIMEOUT)))
     {
