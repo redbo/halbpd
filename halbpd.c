@@ -6,20 +6,24 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <time.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/stat.h>
+#include <pwd.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <openssl/crypto.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/engine.h>
+#include <sys/socket.h>
 #include <sys/types.h>
-#include <pwd.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <sys/mman.h>
 
 #define BUFSIZE 32768
-#define STACKSIZE (1024 * 64) // 64 kb is enough for anyone
+#define STACKSIZE (1024 * 16) // 16 kb is enough for anyone
 #define TIMEOUT 60000000 // 60 seconds
+#define LISTEN_QUEUE 1024
 #define BACKEND_CONNECT_TIMEOUT 5000000 // 2 seconds
 #define DEFAULT_CONFIG_FILE "/etc/halbpd/config"
 #define DEFAULT_CIPHER_LIST "AES128-SHA:AES:RC4:CAMELLIA128-SHA:!MD5:!ADH:!DH:!ECDH:!PSK:!SSLv2"
@@ -30,6 +34,7 @@
 #define DEFAULT_SESSION_STORE "/dev/shm"
 #define DEFAULT_USERNAME "root"
 #define DEFAULT_PROXY_MODE "enabled"
+#define MAX_FILES 8192
 
 #define CHECKRESPONSE(x, y) if ((y) < 0) {perror((x));exit(1);}
 
@@ -37,12 +42,16 @@ typedef struct conndata {
   struct sockaddr addr;
   struct sockaddr_in *addr_in;
   SSL *ssl;
+  char c2sbuf[BUFSIZE];
+  char s2cbuf[BUFSIZE];
+  struct conndata *next;
 } conndata;
 
 struct addrinfo *backend_sa;
 struct addrinfo *frontend_sa;
 int frontend_port;
 int haproxy_mode;
+conndata *conndata_list = NULL;
 
 static int stb_new(BIO *bi)
 {
@@ -118,10 +127,13 @@ void *handle_connection(conndata *data)
 {
   int size = 1;
   st_thread_t c2s, s2c;
+  SSL *ssl = data->ssl;
   int sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 
   if (sock < 0)
     return NULL;
+
+  setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &size, sizeof(size));
 
   st_netfd_t server_sock = st_netfd_open_socket(sock);
 
@@ -131,17 +143,15 @@ void *handle_connection(conndata *data)
   if (st_connect(server_sock, backend_sa->ai_addr, backend_sa->ai_addrlen, BACKEND_CONNECT_TIMEOUT))
     goto cleanup;
 
-  setsockopt(st_netfd_fileno(server_sock), IPPROTO_TCP, TCP_NODELAY, &size, sizeof(size));
   SSL_set_accept_state(data->ssl);
 
   void *client_to_server(void *arg)
   {
-    char buffer[BUFSIZE], ipbuf[1024];
+    char ipbuf[48];
     int bufpos = 0, buflen = 0, wlen = 0;
-    SSL *ssl = data->ssl;
 
     if (haproxy_mode)
-      buflen = snprintf(buffer, sizeof(buffer), "PROXY %s %s %s %u %u\r\n",
+      buflen = snprintf(data->c2sbuf, sizeof(data->c2sbuf), "PROXY %s %s %s %u %u\r\n",
                         (data->addr.sa_family == AF_INET6) ? "TCP6" : "TCP4",
                         inet_ntop(data->addr_in->sin_family,
                           &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
@@ -149,16 +159,16 @@ void *handle_connection(conndata *data)
                           &data->addr_in->sin_addr, ipbuf, sizeof(ipbuf)),
                         ntohs(data->addr_in->sin_port), frontend_port);
 
-    buflen += SSL_read(ssl, &buffer[buflen], sizeof(buffer) - buflen);
+    buflen += SSL_read(ssl, data->c2sbuf + buflen, sizeof(data->c2sbuf) - buflen);
     do
     {
       for (bufpos = 0; (bufpos < buflen); bufpos += wlen)
       {
-        if ((wlen = st_write(server_sock, buffer + bufpos, buflen - bufpos, TIMEOUT)) < 0)
+        if ((wlen = st_write(server_sock, data->c2sbuf + bufpos, buflen - bufpos, TIMEOUT)) < 0)
           goto client_to_server_cleanup;
       }
     }
-    while ((buflen = SSL_read(ssl, buffer, sizeof(buffer))) > 0);
+    while ((buflen = SSL_read(ssl, data->c2sbuf, sizeof(data->c2sbuf))) > 0);
 
     client_to_server_cleanup:
       st_thread_interrupt(s2c);
@@ -167,15 +177,13 @@ void *handle_connection(conndata *data)
 
   void *server_to_client(void *arg)
   {
-    char buffer[BUFSIZE];
     int bufpos = 0, buflen = 0, wlen = 0;
-    SSL *ssl = data->ssl;
 
-    while ((buflen = st_read(server_sock, buffer, sizeof(buffer), TIMEOUT)) > 0)
+    while ((buflen = st_read(server_sock, data->s2cbuf, sizeof(data->s2cbuf), TIMEOUT)) > 0)
     {
       for (bufpos = 0; (bufpos < buflen); bufpos += wlen)
       {
-        if ((wlen = SSL_write(ssl, buffer + bufpos, buflen - bufpos)) < 0)
+        if ((wlen = SSL_write(ssl, data->s2cbuf + bufpos, buflen - bufpos)) < 0)
           goto server_to_client_cleanup;
       }
     }
@@ -197,7 +205,8 @@ void *handle_connection(conndata *data)
     SSL_free(data->ssl);
     if (server_sock)
       st_netfd_close(server_sock);
-    free(data);
+    data->next = conndata_list;
+    conndata_list = data;
 
   return NULL;
 }
@@ -249,8 +258,31 @@ SSL_CTX *ssl_init(char *cert, char *key, char *cipher_list)
   CHECKSSL(SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) <= 0)
   SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
   SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
-
+  ENGINE_load_builtin_engines();
+  ENGINE_register_all_complete();
+  ENGINE *e = ENGINE_by_id("aesni");
+  if (e)
+  {
+    ENGINE_init(e);
+    ENGINE_set_default_RSA(e);
+    ENGINE_set_default_DSA(e);
+    ENGINE_set_default(e, ENGINE_METHOD_ALL);
+  }
+  else
+    fprintf(stderr, "Unable to load aesni engine.\n");
+  ENGINE_ctrl_cmd_string(e, "THREAD_LOCKING", "0", 0);
+  ENGINE_ctrl_cmd_string(e, "FORK_CHECK", "0", 0);
   return ctx;
+}
+
+int is_enabled(char *setting)
+{
+  char *truthy[] = {"true", "t", "on", "enabled", 0};
+  int i = 0;
+  for (i = 0; truthy[i]; i++)
+    if (!strcasecmp(truthy[i], setting))
+      return 1;
+  return 0;
 }
 
 int main(int argc, char **argv)
@@ -268,6 +300,7 @@ int main(int argc, char **argv)
   SSL_CTX *ctx = NULL;
   st_netfd_t listener = NULL, client = NULL;
   FILE *fp = NULL;
+  struct rlimit rl = {MAX_FILES, MAX_FILES};
 
   BIO_METHOD methods_stbp =
   {
@@ -325,18 +358,22 @@ int main(int argc, char **argv)
   if (!(ctx = ssl_init(rsa_server_cert, rsa_server_key, cipher_list)))
     return 1;
 
-  haproxy_mode = !strcasecmp(proxymode, "true") || !strcasecmp(proxymode, "t") ||
-                 !strcasecmp(proxymode, "on") || !strcasecmp(proxymode, "enabled");
+  haproxy_mode = is_enabled(proxymode);
 
   if (!process_count)
     process_count = default_process_count();
 
   umask(077);
 
+  mlockall(MCL_CURRENT | MCL_FUTURE);
+
+  if (setrlimit(RLIMIT_NOFILE, &rl))
+    perror("Increasing fileno ulimit - requires root");
+
   CHECKRESPONSE("socket", listen_sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP))
   CHECKRESPONSE("setsockopt", setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (char *) &sockopt, sizeof(sockopt)))
   CHECKRESPONSE("bind", bind(listen_sock, frontend_sa->ai_addr, frontend_sa->ai_addrlen))
-  CHECKRESPONSE("listen", listen(listen_sock, SOMAXCONN))
+  CHECKRESPONSE("listen", listen(listen_sock, LISTEN_QUEUE))
 
   if ((pw = getpwnam(username)))
   {
@@ -365,7 +402,18 @@ int main(int argc, char **argv)
   for (;;)
   {
     int adlen, client_sock, size;
-    conndata *data = (conndata *)malloc(sizeof(conndata));
+    conndata *data;
+
+    if (conndata_list)
+    {
+      data = conndata_list;
+      conndata_list = data->next;
+    }
+    else
+    {
+      data = (conndata *)malloc(sizeof(conndata));
+      data->next = NULL;
+    }
     adlen = sizeof(data->addr);
     if ((client = st_accept(listener, (struct sockaddr*)&(data->addr), &adlen, TIMEOUT)))
     {
